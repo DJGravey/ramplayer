@@ -1,0 +1,459 @@
+/* test_player.c - exercises the player's specified behaviour without a window.
+ *
+ * Everything here drives the same entry points main.c calls when SDL delivers
+ * an event, so the timeline mapping, the transport buttons and the playback
+ * loop are tested as the user drives them.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "app.h"
+#include "cache.h"
+#include "color.h"
+#include "font.h"
+#include "reader.h"
+#include "sequence.h"
+#include "ui.h"
+#include "util.h"
+
+static int g_pass, g_fail;
+
+#define CHECK(cond, ...)                                                      \
+    do {                                                                      \
+        if (cond) { g_pass++; }                                               \
+        else { g_fail++; printf("  FAIL %s:%d: ", __FILE__, __LINE__);        \
+               printf(__VA_ARGS__); printf("\n"); }                           \
+    } while (0)
+
+#define WIN_W 1200
+#define WIN_H 800
+
+static const int MOUSE_LEFT = 1;
+
+static void click(App *a, int x, int y)
+{
+    app_mouse_down(a, x, y, MOUSE_LEFT);
+    app_mouse_up(a, x, y, MOUSE_LEFT);
+}
+
+static int btn_cx(const App *a, ButtonId b) { return a->layout.buttons[b].x + a->layout.buttons[b].w / 2; }
+static int btn_cy(const App *a, ButtonId b) { return a->layout.buttons[b].y + a->layout.buttons[b].h / 2; }
+
+/* ---- tests -------------------------------------------------------------- */
+
+static void test_timeline_mapping(App *a)
+{
+    printf("timeline mapping\n");
+    const Layout *L = &a->layout;
+    int n = a->seq->count;
+    Rect t = L->track;
+
+    CHECK(ui_frame_at_x(L, t.x, n) == 0, "leftmost pixel must be the first frame");
+    CHECK(ui_frame_at_x(L, t.x + t.w - 1, n) == n - 1, "rightmost pixel must be the last frame");
+
+    /* Clicks outside the track clamp rather than running off the sequence. */
+    CHECK(ui_frame_at_x(L, t.x - 500, n) == 0, "left of the track clamps to the first frame");
+    CHECK(ui_frame_at_x(L, t.x + t.w + 500, n) == n - 1, "right of the track clamps to the last frame");
+
+    /* Halfway along is the middle of the sequence. */
+    int mid = ui_frame_at_x(L, t.x + (t.w - 1) / 2, n);
+    CHECK(abs(mid - (n - 1) / 2) <= 1, "midpoint maps near the middle frame (got %d of %d)", mid, n);
+
+    /* With more pixels than frames the mapping must round trip exactly. */
+    int roundtrip_ok = 1;
+    for (int f = 0; f < n; f++)
+        if (ui_frame_at_x(L, ui_x_for_frame(L, f, n), n) != f) roundtrip_ok = 0;
+    CHECK(roundtrip_ok, "frame -> x -> frame must round trip for every frame");
+
+    /* And it must increase monotonically across the track. */
+    int mono_ok = 1, prev = -1;
+    for (int x = t.x; x < t.x + t.w; x++) {
+        int f = ui_frame_at_x(L, x, n);
+        if (f < prev) mono_ok = 0;
+        prev = f;
+    }
+    CHECK(mono_ok, "frame under the cursor must never go backwards moving right");
+}
+
+static void test_timeline_click_and_drag(App *a)
+{
+    printf("timeline press, drag and release\n");
+    const Layout *L = &a->layout;
+    int n = a->seq->count;
+    int ty = L->track.y + L->track.h / 2;
+
+    /* Spec: pressing the left button on the timeline pauses playback. */
+    app_toggle_play(a, +1);
+    CHECK(a->play_dir == +1, "play forwards should start playback");
+    app_mouse_down(a, ui_x_for_frame(L, 40, n), ty, MOUSE_LEFT);
+    CHECK(a->play_dir == 0, "pressing the timeline must pause playback");
+    CHECK(a->current == 40, "pressing the timeline must jump to that frame (got %d)", a->current);
+
+    /* Spec: the frame keeps updating while the button stays down. */
+    app_mouse_move(a, ui_x_for_frame(L, 70, n), ty, 1);
+    CHECK(a->current == 70, "dragging must keep updating the frame (got %d)", a->current);
+    app_mouse_move(a, ui_x_for_frame(L, 12, n), ty, 1);
+    CHECK(a->current == 12, "dragging backwards must work too (got %d)", a->current);
+
+    /* Dragging beyond the ends pins to the first and last frames. */
+    app_mouse_move(a, L->track.x - 2000, ty, 1);
+    CHECK(a->current == 0, "dragging off the left end pins to the first frame");
+    app_mouse_move(a, L->track.x + L->track.w + 2000, ty, 1);
+    CHECK(a->current == n - 1, "dragging off the right end pins to the last frame");
+
+    /* After release, moving the mouse must no longer scrub. */
+    app_mouse_up(a, ui_x_for_frame(L, n - 1, n), ty, MOUSE_LEFT);
+    app_mouse_move(a, ui_x_for_frame(L, 5, n), ty, 0);
+    CHECK(a->current == n - 1, "releasing must stop scrubbing (got %d)", a->current);
+
+    /* A plain click still selects the clicked frame. */
+    click(a, ui_x_for_frame(L, 33, n), ty);
+    CHECK(a->current == 33, "clicking the timeline selects that frame (got %d)", a->current);
+}
+
+static void test_transport_buttons(App *a)
+{
+    printf("transport buttons\n");
+    app_pause(a);
+    app_set_frame(a, 20);
+
+    click(a, btn_cx(a, BTN_PLAY_FWD), btn_cy(a, BTN_PLAY_FWD));
+    CHECK(a->play_dir == +1, "play forwards button starts forward playback");
+
+    /* Spec: clicking the same button again pauses. */
+    click(a, btn_cx(a, BTN_PLAY_FWD), btn_cy(a, BTN_PLAY_FWD));
+    CHECK(a->play_dir == 0, "play forwards button pauses when clicked again");
+
+    click(a, btn_cx(a, BTN_PLAY_BACK), btn_cy(a, BTN_PLAY_BACK));
+    CHECK(a->play_dir == -1, "play backwards button starts reverse playback");
+    click(a, btn_cx(a, BTN_PLAY_BACK), btn_cy(a, BTN_PLAY_BACK));
+    CHECK(a->play_dir == 0, "play backwards button pauses when clicked again");
+
+    /* The opposite button changes direction rather than pausing. */
+    click(a, btn_cx(a, BTN_PLAY_FWD), btn_cy(a, BTN_PLAY_FWD));
+    click(a, btn_cx(a, BTN_PLAY_BACK), btn_cy(a, BTN_PLAY_BACK));
+    CHECK(a->play_dir == -1, "the other play button switches direction");
+
+    /* Spec: step buttons pause first, then move one frame. */
+    int before = a->current;
+    click(a, btn_cx(a, BTN_NEXT), btn_cy(a, BTN_NEXT));
+    CHECK(a->play_dir == 0, "next frame button pauses playback");
+    CHECK(a->current == before + 1, "next frame button advances one frame (%d -> %d)", before, a->current);
+
+    click(a, btn_cx(a, BTN_PLAY_FWD), btn_cy(a, BTN_PLAY_FWD));
+    before = a->current;
+    click(a, btn_cx(a, BTN_PREV), btn_cy(a, BTN_PREV));
+    CHECK(a->play_dir == 0, "previous frame button pauses playback");
+    CHECK(a->current == before - 1, "previous frame button steps back one frame (%d -> %d)", before, a->current);
+
+    /* A press that drifts off the button before release must not fire it. */
+    app_set_frame(a, 20);
+    app_mouse_down(a, btn_cx(a, BTN_NEXT), btn_cy(a, BTN_NEXT), MOUSE_LEFT);
+    app_mouse_up(a, a->layout.viewport.x + 5, a->layout.viewport.y + 5, MOUSE_LEFT);
+    CHECK(a->current == 20, "releasing away from a button must not activate it");
+}
+
+static void test_step_wrapping(App *a)
+{
+    printf("stepping past the ends\n");
+    int n = a->seq->count;
+
+    app_set_frame(a, n - 1);
+    app_step(a, +1);
+    CHECK(a->current == 0, "stepping past the last frame wraps to the first (got %d)", a->current);
+
+    app_set_frame(a, 0);
+    app_step(a, -1);
+    CHECK(a->current == n - 1, "stepping before the first frame wraps to the last (got %d)", a->current);
+}
+
+/* Waits until the whole sequence is resident so playback cannot stall. */
+static int wait_for_cache(Cache *c, int want, double timeout)
+{
+    double t0 = rp_now();
+    CacheStats st;
+    for (;;) {
+        cache_get_stats(c, &st);
+        if (st.ready >= want) return 1;
+        if (rp_now() - t0 > timeout) {
+            printf("  (cache filled %d/%d in %.1fs)\n", st.ready, want, timeout);
+            return st.ready > want / 2;
+        }
+        struct timespec ts = { 0, 20 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+}
+
+/* Drives app_tick() until the playhead moves, with the clock forced due. */
+static int advance_one(App *a)
+{
+    int start = a->current;
+    for (int i = 0; i < 400; i++) {
+        a->next_due = rp_now() - 1.0;
+        app_tick(a);
+        if (a->current != start) return 1;
+        struct timespec ts = { 0, 5 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    return 0;
+}
+
+static void test_playback_loops(App *a)
+{
+    printf("playback advance and looping\n");
+    int n = a->seq->count;
+
+    app_pause(a);
+    app_set_frame(a, 10);
+    app_toggle_play(a, +1);
+    CHECK(advance_one(a), "forward playback advances the frame");
+    CHECK(a->current == 11, "forward playback moves to the next frame (got %d)", a->current);
+
+    /* Spec: forward playback loops round to the first frame. */
+    app_set_frame(a, n - 1);
+    CHECK(advance_one(a), "forward playback advances at the last frame");
+    CHECK(a->current == 0, "forward playback loops to the first frame (got %d)", a->current);
+
+    app_pause(a);
+    app_set_frame(a, 10);
+    app_toggle_play(a, -1);
+    CHECK(advance_one(a), "reverse playback advances the frame");
+    CHECK(a->current == 9, "reverse playback moves to the previous frame (got %d)", a->current);
+
+    /* Spec: backward playback loops round to the last frame. */
+    app_set_frame(a, 0);
+    CHECK(advance_one(a), "reverse playback advances at the first frame");
+    CHECK(a->current == n - 1, "reverse playback loops to the last frame (got %d)", a->current);
+
+    app_pause(a);
+    int held = a->current;
+    a->next_due = rp_now() - 1.0;
+    app_tick(a);
+    CHECK(a->current == held, "a paused player must not advance");
+}
+
+static void test_keyboard(App *a)
+{
+    printf("keyboard shortcuts\n");
+    app_pause(a);
+    app_set_frame(a, 50);
+
+    app_key(a, KEY_SPACE);
+    CHECK(a->play_dir == +1, "space starts playback");
+    app_key(a, KEY_SPACE);
+    CHECK(a->play_dir == 0, "space pauses again");
+
+    app_key(a, KEY_RIGHT);
+    CHECK(a->current == 51, "right steps forward (got %d)", a->current);
+    app_key(a, KEY_LEFT);
+    CHECK(a->current == 50, "left steps back (got %d)", a->current);
+
+    app_key(a, KEY_HOME);
+    CHECK(a->current == 0, "home goes to the first frame");
+    app_key(a, KEY_END);
+    CHECK(a->current == a->seq->count - 1, "end goes to the last frame");
+
+    app_key(a, KEY_PLAY_BACK);
+    CHECK(a->play_dir == -1, "b plays backwards");
+    app_key(a, KEY_PLAY_BACK);
+    CHECK(a->play_dir == 0, "b pauses again");
+}
+
+static void test_memory_budget(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("memory budget and eviction\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    size_t limit = per_frame * 8; /* deliberately far smaller than the sequence */
+
+    Cache *c = cache_create(seq, lut, limit, 4, per_frame);
+    CHECK(c != NULL, "cache creates with a small budget");
+    if (!c) return;
+
+    cache_set_focus(c, 0, +1);
+    wait_for_cache(c, 6, 10.0);
+
+    CacheStats st;
+    cache_get_stats(c, &st);
+    CHECK(st.bytes_used <= limit, "cache must stay inside its budget (%zu of %zu)",
+          st.bytes_used, limit);
+    CHECK(st.ready > 0 && st.ready <= 9, "cache holds about the budgeted frame count (%d)", st.ready);
+
+    /* Frames near the playhead are the ones worth keeping. */
+    CHECK(cache_frame_state(c, 0) == CACHE_READY, "the frame under the playhead is resident");
+
+    /* Move the playhead far away; the loaders must follow it and the old
+     * region must be given up rather than the cache growing. */
+    int far = seq->count - 1;
+    cache_set_focus(c, far, +1);
+    double t0 = rp_now();
+    while (cache_frame_state(c, far) != CACHE_READY && rp_now() - t0 < 10.0) {
+        struct timespec ts = { 0, 20 * 1000 * 1000 };
+        nanosleep(&ts, NULL);
+    }
+    CHECK(cache_frame_state(c, far) == CACHE_READY, "scrubbing elsewhere loads the new frame");
+
+    cache_get_stats(c, &st);
+    CHECK(st.bytes_used <= limit, "cache stays inside its budget after scrubbing (%zu of %zu)",
+          st.bytes_used, limit);
+
+    /* A reference taken by the drawing code must survive eviction. */
+    Image *held = cache_acquire(c, far);
+    CHECK(held != NULL, "can acquire a resident frame");
+    if (held) {
+        cache_set_focus(c, 0, +1);
+        wait_for_cache(c, 4, 10.0);
+        /* Reading the pixels must still be valid even if `far` was evicted. */
+        volatile uint32_t probe = held->px[(size_t)held->width * held->height - 1];
+        (void)probe;
+        CHECK(held->width == seq->width, "held image stays intact after eviction");
+        image_unref(held);
+    }
+
+    cache_destroy(c);
+}
+
+/* A budget too small for two frames cannot let playback advance, so the cache
+ * raises it to that floor. Without it the player would sit on frame one
+ * forever, which looks like a hang rather than a configuration problem. */
+static void test_minimum_budget(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("budget below one frame\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    Cache *c = cache_create(seq, lut, 1024, 2, per_frame); /* absurdly small */
+    CHECK(c != NULL, "cache creates with an unusable budget");
+    if (!c) return;
+
+    App app;
+    app_init(&app, seq, c, 24.0);
+    app_resize(&app, WIN_W, WIN_H);
+
+    CHECK(wait_for_cache(c, 2, 15.0), "at least two frames become resident");
+
+    app_toggle_play(&app, +1);
+    CHECK(advance_one(&app), "playback can still advance on a minimal budget");
+
+    CacheStats st;
+    cache_get_stats(c, &st);
+    CHECK(st.bytes_limit >= per_frame * 2, "the budget was raised to hold two frames");
+
+    app_shutdown(&app);
+    cache_destroy(c);
+}
+
+/* Drives the cache the way a user dragging the playhead around does: constant
+ * focus changes against a budget far too small to hold the sequence, while
+ * frames are still being decoded. Run under a sanitiser this is the best shot
+ * at catching a race between the loaders and the drawing code. */
+static void test_scrub_stress(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("scrubbing under load\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    Cache *c = cache_create(seq, lut, per_frame * 6, 4, per_frame);
+    CHECK(c != NULL, "stress cache creates");
+    if (!c) return;
+
+    App app;
+    app_init(&app, seq, c, 24.0);
+    app_resize(&app, WIN_W, WIN_H);
+
+    Rect track = app.layout.track;
+    int ty = track.y + track.h / 2;
+    unsigned seed = 0x9e3779b9u;
+    int shown = 0, iterations = 0;
+    double t0 = rp_now();
+
+    while (rp_now() - t0 < 3.0) {
+        seed = seed * 1103515245u + 12345u;
+        int x = track.x + (int)((seed >> 8) % (unsigned)track.w);
+
+        app_mouse_down(&app, x, ty, MOUSE_LEFT);
+        for (int k = 0; k < 5; k++) {
+            seed = seed * 1103515245u + 12345u;
+            app_mouse_move(&app, track.x + (int)((seed >> 8) % (unsigned)track.w), ty, 1);
+            app_update_shown(&app);
+        }
+        app_mouse_up(&app, x, ty, MOUSE_LEFT);
+
+        /* Occasionally play for a moment, so the loaders see a direction
+         * change as well as a jump. */
+        if ((seed & 7) == 0) {
+            app_toggle_play(&app, (seed & 8) ? +1 : -1);
+            app.next_due = rp_now() - 1.0;
+            app_tick(&app);
+            app_pause(&app);
+        }
+
+        app_update_shown(&app);
+        if (app.shown) shown++;
+        iterations++;
+    }
+
+    CacheStats st;
+    cache_get_stats(c, &st);
+    CHECK(st.bytes_used <= per_frame * 6,
+          "the budget holds through %d scrubs (%zu of %zu bytes)",
+          iterations, st.bytes_used, per_frame * 6);
+    CHECK(shown > 0, "frames were displayed while scrubbing (%d of %d)", shown, iterations);
+    CHECK(app.current >= 0 && app.current < seq->count, "the playhead stayed in range");
+
+    app_shutdown(&app);
+    cache_destroy(c);
+}
+
+/* ---- main --------------------------------------------------------------- */
+
+int main(int argc, char **argv)
+{
+    const char *input = (argc > 1) ? argv[1] : "test/seq_a";
+
+    char err[512];
+    char *const inputs[1] = { (char *)input };
+    Sequence *seq = sequence_open(inputs, 1, err, sizeof err);
+    if (!seq) {
+        printf("cannot open '%s': %s\n", input, err);
+        return 2;
+    }
+    if (!reader_probe(seq->frames[0].path, &seq->width, &seq->height, NULL, err, sizeof err)) {
+        printf("cannot probe '%s': %s\n", seq->frames[0].path, err);
+        return 2;
+    }
+    printf("sequence: %s, %d frames, %dx%d\n\n", seq->display, seq->count, seq->width, seq->height);
+
+    font_init();
+    static ColorLUT lut;
+    color_lut_init(&lut);
+
+    Cache *cache = cache_create(seq, &lut, (size_t)1024 * 1024 * 1024, 4,
+                                (size_t)seq->width * seq->height * 4);
+    if (!cache) { printf("cannot create cache\n"); return 2; }
+
+    App app;
+    app_init(&app, seq, cache, 24.0);
+    app_resize(&app, WIN_W, WIN_H);
+
+    test_timeline_mapping(&app);
+    test_timeline_click_and_drag(&app);
+    test_transport_buttons(&app);
+    test_step_wrapping(&app);
+    test_keyboard(&app);
+
+    wait_for_cache(cache, seq->count, 30.0);
+    test_playback_loops(&app);
+
+    app_shutdown(&app);
+    cache_destroy(cache);
+
+    test_memory_budget(seq, &lut);
+    test_minimum_budget(seq, &lut);
+    test_scrub_stress(seq, &lut);
+
+    sequence_free(seq);
+
+    printf("\n%d passed, %d failed\n", g_pass, g_fail);
+    return g_fail ? 1 : 0;
+}

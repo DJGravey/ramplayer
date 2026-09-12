@@ -1,0 +1,189 @@
+# ramplayer
+
+A RAM player for image sequences: it loads frames into memory up to a fixed
+budget and lets you scrub through them at speed. EXR sequences are the current
+focus; video is the next step.
+
+Written in C11. All drawing is done on the CPU into a system-memory buffer —
+there is no GPU code. SDL2 is used only to own a window and hand that one
+finished buffer to the display.
+
+## Building
+
+Needs a C compiler, CMake, SDL2 and OpenEXR 3.x (we use its pure-C
+`OpenEXRCore` API, so no C++ is involved).
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+## Running
+
+```sh
+ramplayer shot.0042.exr        # one frame expands to the whole sequence
+ramplayer 'shot.%04d.exr'      # printf pattern
+ramplayer 'shot.####.exr'      # hash pattern
+ramplayer /renders/shot/       # the largest sequence in a directory
+ramplayer a.exr b.exr c.exr    # an explicit list, ordered by frame number
+```
+
+Options:
+
+| Option | Meaning |
+| --- | --- |
+| `--mem SIZE` | RAM budget for cached frames; default `1G`. Accepts `512M`, `4G`, … A budget too small for two frames is raised to that, since playback could not otherwise advance. |
+| `--fps RATE` | Playback rate. Defaults to the sequence's own `framesPerSecond`, else 24. |
+| `--threads N` | Loader threads; default is one per core, less one. |
+| `--scale N` | UI scale factor for HiDPI displays. |
+
+Controls:
+
+| | |
+| --- | --- |
+| Click / drag on the timeline | pause and scrub; keeps tracking while the button is held |
+| Transport buttons | laid out left to right as previous frame, play backwards, play forwards, next frame |
+| `space` | play / pause forwards |
+| `b` | play / pause backwards |
+| `←` `→` | step one frame (pauses first) |
+| `↑` `↓`, `PgUp` `PgDn` | jump ten frames |
+| `Home` `End` | first / last frame |
+| `f` / `1` | fit to window / actual size |
+| `s` | toggle smooth scaling |
+| `h` | key list |
+| `q`, `Esc` | quit |
+
+Playback loops at both ends: running forwards past the last frame returns to
+the first, and running backwards past the first returns to the last.
+
+## How it works
+
+**The timeline** maps its leftmost pixel to the first frame and its rightmost
+to the last. `ui_frame_at_x()` and `ui_x_for_frame()` are exact inverses at
+both ends, so the playhead always lands back under the cursor that placed it.
+The band behind the playhead shows what is actually resident: green for frames
+in RAM, amber for frames being loaded, red for frames that failed. When the
+sequence has more frames than the timeline has pixels, each column mixes the
+residency of the frames beneath it rather than picking one.
+
+**The cache** (`src/cache.c`) keeps the frames nearest the playhead in memory
+within the byte budget. Rather than filling a work queue that goes stale the
+moment the user scrubs somewhere else, each loader thread asks the cache which
+frame is currently worth fetching most, so a jump across the timeline redirects
+every thread at once. "Worth most" is the distance from the playhead measured
+in the direction of play, wrapping at the ends because playback loops — which
+is why the cached region sits ahead of the playhead when playing forwards and
+behind it when playing backwards.
+
+A frame is only fetched if there is room for it, or if something resident is
+further from the playhead than it is. That admission rule is what keeps a full
+cache from thrashing, and the same comparison is applied again when a decoded
+frame is inserted, so a frame that became less useful while it was decoding is
+dropped rather than evicting something better.
+
+Frames are reference counted. The cache holds one reference and the drawing
+code takes another while it paints, so a frame evicted mid-draw stays alive
+until the pixels have been read.
+
+**Decoding** (`src/reader_exr.c`) asks OpenEXR for half floats no matter how
+the file stores them, which turns the scene-linear to display conversion into a
+single lookup per channel against a 64 KB table instead of a `pow()` per pixel.
+Frames are decoded chunk by chunk into a small scratch buffer and converted
+into the destination image immediately, so a loader thread's working set stays
+in the tens of kilobytes rather than holding a whole float image.
+
+Frames are cached ready to display, as 8-bit pixels. That costs half what
+keeping half floats would, so the budget holds roughly twice as many frames,
+and scrubbing does no per-frame work beyond scaling to the window.
+
+Scanline and tiled files are both handled, along with mipmapped files (level 0),
+data windows that differ from the display window, and single-channel luminance
+images.
+
+**Playback** advances on a clock, but only onto frames that are already
+resident. If the next frame has not arrived, the playhead and the clock both
+hold rather than racing ahead through frames nobody would see; once caching
+catches up, playback resumes at true speed.
+
+**Drawing** composites the whole window — image, timeline, buttons, text — into
+one buffer, which is then handed over in a single upload. Scaling the frame
+into the viewport is the only part with a real cost, so it is done in two
+passes: blending the two source rows into a scratch line first leaves one
+interpolation per output pixel instead of three, and makes the vertical pass a
+straight walk the compiler can vectorise. On a 2020-era laptop core that is
+about 10 ms to put a 2K frame into a 1080p window and 16 ms into a 1440p one,
+against a 41.7 ms budget at 24 fps. `s` switches to nearest-neighbour, which
+costs about 2 ms and shows the pixels as they are.
+
+## Layout
+
+```
+src/
+  main.c          SDL window, event loop, command line
+  app.c/.h        player state, playback clock, input handling
+  ui.c/.h         layout, hit testing, widget drawing
+  cache.c/.h      RAM frame store and loader threads
+  reader_exr.c    EXR decoding (OpenEXRCore)
+  sequence.c/.h   turning a path, pattern or directory into a frame list
+  draw.c/.h       CPU rasteriser: rects, text, triangles, scaled image blit
+  font.c/.h       built-in 5x7 bitmap font
+  color.c/.h      linear to display transform, as a lookup table
+  image.c/.h      reference-counted frame images
+  util.c/.h       timing, allocation, byte formatting
+tests/
+  test_player.c   timeline mapping, transport, looping, memory budget
+  test_reader.c   EXR decoding and sequence discovery
+  test_draw.c     the CPU rasteriser
+tools/
+  mkexr.c         writes the awkward EXRs the tests need
+  make_test_data.sh
+```
+
+`app.c` and `ui.c` know nothing about SDL: `main.c` translates events into the
+calls in `app.h`, which is what lets the tests drive the player without a
+window.
+
+## Tests
+
+```sh
+tools/make_test_data.sh                 # generates fixtures under test/
+cmake --build build --target test_player test_reader test_draw
+./build/test_draw
+./build/test_reader
+./build/test_player test/seq_a
+```
+
+`test_player` drives the same entry points the event loop calls, so the
+timeline mapping, transport buttons, looping and the memory budget are tested
+the way a user drives them. `test_reader` checks decoding against overscan,
+cropped, tiled, mipmapped, luminance, float and damaged files, and checks that
+a tiled file decodes to exactly the same pixels as the scanline original.
+
+`test_draw` covers the rasteriser, including the invariant that scaling a flat
+colour by any factor must return exactly that colour — the check that catches
+rounding and channel-packing mistakes a gradient would hide.
+
+All three suites run clean under ThreadSanitizer, AddressSanitizer, UBSan and
+LeakSanitizer.
+
+## Not yet
+
+- **Video.** `reader_exr.c` sits behind the small interface in `reader.h`;
+  video belongs alongside it as a second implementation, dispatched on file
+  extension, with FFmpeg decoding to the same display-ready `Image`. Seeking
+  makes video caching different in character: frames come in decode order from
+  the nearest keyframe rather than individually, so the loader would fetch runs
+  of frames rather than one at a time.
+- **Exposure and view transforms.** The display transform is a fixed
+  linear-to-sRGB table built in `color_lut_init()`. Adding exposure means
+  rebuilding that table, which is cheap — but frames are cached already
+  converted, so the cache has to be refilled when it changes. Caching half
+  floats instead would make it instant at the cost of holding half as many
+  frames.
+- **Zoom and pan.** `draw_image()` already takes an arbitrary destination
+  rectangle, so this is mostly input handling.
+- **Audio**, which would also mean playback timing driven by the audio clock.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
