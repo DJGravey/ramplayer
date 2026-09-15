@@ -9,7 +9,7 @@ void app_init(App *a, const Sequence *seq, Cache *cache, double fps)
     memset(a, 0, sizeof *a);
     a->seq         = seq;
     a->cache       = cache;
-    a->fps         = (fps > 0.0) ? fps : 24.0;
+    a->fps         = (fps > 0.0) ? fps : 30.0;
     a->current     = 0;
     a->play_dir    = 0;
     a->last_dir    = 1;

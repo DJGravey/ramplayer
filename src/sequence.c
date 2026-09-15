@@ -1,62 +1,66 @@
 #include "sequence.h"
 
 #include <ctype.h>
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/stat.h>
 
+#include "platform.h"
 #include "util.h"
 
 /* ---- small helpers ------------------------------------------------------ */
+
+/* Case-insensitive comparison of ASCII strings, so that ".EXR" counts. */
+static int ascii_ieq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
+    return *a == *b;
+}
 
 static int has_image_ext(const char *name)
 {
     const char *dot = strrchr(name, '.');
     if (!dot) return 0;
-    return strcasecmp(dot, ".exr") == 0;
+    return ascii_ieq(dot, ".exr");
+}
+
+/* The last path separator in path, or NULL if there is none. */
+static const char *last_sep(const char *path)
+{
+    const char *sep = NULL;
+    for (const char *p = path; *p; p++)
+        if (rp_is_path_sep(*p)) sep = p;
+    return sep;
 }
 
 static const char *base_name(const char *path)
 {
-    const char *slash = strrchr(path, '/');
-    return slash ? slash + 1 : path;
+    const char *sep = last_sep(path);
+    return sep ? sep + 1 : path;
 }
 
 static char *dir_name(const char *path)
 {
-    const char *slash = strrchr(path, '/');
-    if (!slash) return rp_strdup(".");
-    if (slash == path) return rp_strdup("/");
-    size_t n = (size_t)(slash - path);
+    const char *sep = last_sep(path);
+    if (!sep) return rp_strdup(".");
+    size_t n = (size_t)(sep - path);
+    if (n == 0) n = 1; /* keep the root separator itself */
     char *d = rp_xmalloc(n + 1);
     memcpy(d, path, n);
     d[n] = '\0';
     return d;
 }
 
+/* Joins with '/', which every platform we run on accepts. */
 static char *join_path(const char *dir, const char *name)
 {
     size_t dn = strlen(dir);
-    int need_slash = dn > 0 && dir[dn - 1] != '/';
+    int need_slash = dn > 0 && !rp_is_path_sep(dir[dn - 1]);
     size_t n = dn + (size_t)need_slash + strlen(name) + 1;
     char *p = rp_xmalloc(n);
     snprintf(p, n, "%s%s%s", dir, need_slash ? "/" : "", name);
     return p;
-}
-
-static int is_dir(const char *path)
-{
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-}
-
-static int is_file(const char *path)
-{
-    struct stat st;
-    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
 /* ---- name templates ----------------------------------------------------- */
@@ -180,27 +184,27 @@ static int frame_cmp(const void *a, const void *b)
 /* Collects every file in `dir` matching `t`. */
 static int collect_matches(const char *dir, const Template *t, FrameVec *fv, char *err, size_t errsz)
 {
-    DIR *d = opendir(dir);
+    RpDir *d = rp_dir_open(dir);
     if (!d) {
         snprintf(err, errsz, "cannot open directory '%s'", dir);
         return 0;
     }
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
+    const char *name;
+    while ((name = rp_dir_next(d)) != NULL) {
         long num;
-        if (!template_match(t, de->d_name, &num)) continue;
-        char *full = join_path(dir, de->d_name);
-        if (is_file(full)) fv_push(fv, full, num);
+        if (!template_match(t, name, &num)) continue;
+        char *full = join_path(dir, name);
+        if (rp_is_file(full)) fv_push(fv, full, num);
         else free(full);
     }
-    closedir(d);
+    rp_dir_close(d);
     return 1;
 }
 
 /* Finds the largest group of numbered image files in a directory. */
 static int largest_group(const char *dir, Template *out, char *err, size_t errsz)
 {
-    DIR *d = opendir(dir);
+    RpDir *d = rp_dir_open(dir);
     if (!d) {
         snprintf(err, errsz, "cannot open directory '%s'", dir);
         return 0;
@@ -212,13 +216,13 @@ static int largest_group(const char *dir, Template *out, char *err, size_t errsz
     } *groups = NULL;
     int ngroups = 0, cap = 0;
 
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue;
-        if (!has_image_ext(de->d_name)) continue;
+    const char *name;
+    while ((name = rp_dir_next(d)) != NULL) {
+        if (name[0] == '.') continue;
+        if (!has_image_ext(name)) continue;
 
         Template t;
-        if (!split_basename(de->d_name, &t, NULL)) {
+        if (!split_basename(name, &t, NULL)) {
             /* Unnumbered file: it can only ever be a sequence of one, so give
              * it a template that matches nothing else. */
             continue;
@@ -244,7 +248,7 @@ static int largest_group(const char *dir, Template *out, char *err, size_t errsz
         }
         groups[found].count++;
     }
-    closedir(d);
+    rp_dir_close(d);
 
     if (ngroups == 0) {
         free(groups);
@@ -308,7 +312,7 @@ Sequence *sequence_open(char *const *inputs, int n_inputs, char *err, size_t err
     /* Several paths: take them literally, in numeric order. */
     if (n_inputs > 1) {
         for (int i = 0; i < n_inputs; i++) {
-            if (!is_file(inputs[i])) {
+            if (!rp_is_file(inputs[i])) {
                 snprintf(err, errsz, "not a file: '%s'", inputs[i]);
                 for (int j = 0; j < fv.n; j++) free(fv.v[j].path);
                 free(fv.v);
@@ -330,7 +334,7 @@ Sequence *sequence_open(char *const *inputs, int n_inputs, char *err, size_t err
     char *dir = NULL;
     char *display = NULL;
 
-    if (is_dir(in)) {
+    if (rp_is_dir(in)) {
         dir = rp_strdup(in);
         if (!largest_group(dir, &t, err, errsz)) {
             free(dir);
@@ -338,7 +342,7 @@ Sequence *sequence_open(char *const *inputs, int n_inputs, char *err, size_t err
         }
     } else if (split_pattern(base_name(in), &t)) {
         dir = dir_name(in);
-    } else if (is_file(in)) {
+    } else if (rp_is_file(in)) {
         dir = dir_name(in);
         if (!split_basename(base_name(in), &t, NULL)) {
             /* A single unnumbered file is a one frame sequence. */

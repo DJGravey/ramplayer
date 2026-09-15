@@ -10,7 +10,7 @@
 #define RP_CLAMP(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
 #define RP_ARRAY_LEN(a)    ((int)(sizeof(a) / sizeof((a)[0])))
 
-/* Monotonic clock, in seconds. */
+/* Monotonic clock, in seconds. Implemented in platform.c. */
 double rp_now(void);
 
 /* Allocation wrappers that abort on failure; use rp_try_* where a failed

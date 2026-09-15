@@ -7,12 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 #include "app.h"
 #include "cache.h"
 #include "color.h"
 #include "font.h"
+#include "platform.h"
 #include "reader.h"
 #include "sequence.h"
 #include "ui.h"
@@ -181,8 +181,7 @@ static int wait_for_cache(Cache *c, int want, double timeout)
             printf("  (cache filled %d/%d in %.1fs)\n", st.ready, want, timeout);
             return st.ready > want / 2;
         }
-        struct timespec ts = { 0, 20 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
+        rp_sleep_ms(20);
     }
 }
 
@@ -194,8 +193,7 @@ static int advance_one(App *a)
         a->next_due = rp_now() - 1.0;
         app_tick(a);
         if (a->current != start) return 1;
-        struct timespec ts = { 0, 5 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
+        rp_sleep_ms(5);
     }
     return 0;
 }
@@ -290,8 +288,7 @@ static void test_memory_budget(const Sequence *seq, const ColorLUT *lut)
     cache_set_focus(c, far, +1);
     double t0 = rp_now();
     while (cache_frame_state(c, far) != CACHE_READY && rp_now() - t0 < 10.0) {
-        struct timespec ts = { 0, 20 * 1000 * 1000 };
-        nanosleep(&ts, NULL);
+        rp_sleep_ms(20);
     }
     CHECK(cache_frame_state(c, far) == CACHE_READY, "scrubbing elsewhere loads the new frame");
 

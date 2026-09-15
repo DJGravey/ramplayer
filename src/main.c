@@ -22,7 +22,7 @@
 #include "util.h"
 
 #define DEFAULT_MEM_LIMIT ((size_t)1024 * 1024 * 1024) /* 1 GB */
-#define DEFAULT_FPS       24.0
+#define DEFAULT_FPS       30.0
 
 static SDL_Window   *g_window;
 static SDL_Renderer *g_renderer;
@@ -203,7 +203,7 @@ static void usage(FILE *out)
         "\n"
         "options:\n"
         "  --mem SIZE      RAM budget for cached frames (default 1G)\n"
-        "  --fps RATE      playback rate (default 24)\n"
+        "  --fps RATE      playback rate (default 30)\n"
         "  --threads N     loader threads (default: one per core, less one)\n"
         "  --scale N       UI scale factor for HiDPI displays\n"
         "  -h, --help      this message\n"

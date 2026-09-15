@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "windows",
+      "displayName": "Windows x64 (MSVC, Ninja Multi-Config, vcpkg)",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/windows",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "CMAKE_CONFIGURATION_TYPES": "Debug;Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-fixtures",
+      "displayName": "Windows x64, plus the OpenEXR tools the fixture script needs",
+      "inherits": "windows",
+      "cacheVariables": {
+        "VCPKG_MANIFEST_FEATURES": "fixtures"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-release",
+      "configurePreset": "windows",
+      "configuration": "Release"
+    },
+    {
+      "name": "windows-debug",
+      "configurePreset": "windows",
+      "configuration": "Debug"
+    }
+  ]
+}

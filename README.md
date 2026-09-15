@@ -18,6 +18,25 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
+### Windows
+
+Builds with Visual Studio 2022 or later (MSVC 19.35+ for C11 atomics) and
+vcpkg, which fetches SDL2 and OpenEXR from the manifest. From a Developer
+PowerShell with `VCPKG_ROOT` set (Visual Studio's bundled copy lives at
+`<VS>\VC\vcpkg`):
+
+```powershell
+cmake --preset windows
+cmake --build --preset windows-release
+build\windows\Release\ramplayer.exe shot.0042.exr
+```
+
+The `windows-fixtures` preset also builds the OpenEXR command line tools so
+`tools/make_test_data.sh` can run from Git Bash; see Tests below.
+
+Paths are UTF-8 throughout, so non-ASCII names work. Drive-relative paths
+without a separator (`C:shot.0001.exr`) are not supported: give the directory.
+
 ## Running
 
 ```sh
@@ -33,7 +52,7 @@ Options:
 | Option | Meaning |
 | --- | --- |
 | `--mem SIZE` | RAM budget for cached frames; default `1G`. Accepts `512M`, `4G`, … A budget too small for two frames is raised to that, since playback could not otherwise advance. |
-| `--fps RATE` | Playback rate. Defaults to the sequence's own `framesPerSecond`, else 24. |
+| `--fps RATE` | Playback rate. Defaults to the sequence's own `framesPerSecond`, else 30. |
 | `--threads N` | Loader threads; default is one per core, less one. |
 | `--scale N` | UI scale factor for HiDPI displays. |
 
@@ -152,6 +171,12 @@ cmake --build build --target test_player test_reader test_draw
 ./build/test_reader
 ./build/test_player test/seq_a
 ```
+
+On Windows, configure with `--preset windows-fixtures`, build the `mkexr`
+target as well, and run the script from Git Bash in the project root; it finds
+`mkexr` and `exrmaketiled` in the build tree and uses Arial for the burnt-in
+frame numbers. The test executables land in `build\windows\Release\` and are
+run from the project root the same way.
 
 `test_player` drives the same entry points the event loop calls, so the
 timeline mapping, transport buttons, looping and the memory budget are tested

@@ -1,11 +1,11 @@
 #include "cache.h"
 
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "platform.h"
 #include "reader.h"
 #include "util.h"
 
@@ -19,8 +19,8 @@ struct Cache {
     const ColorLUT *lut;
     int             count;
 
-    pthread_mutex_t mu;
-    pthread_cond_t  cv;
+    RpMutex mu;
+    RpCond  cv;
 
     Entry *entries;
 
@@ -44,8 +44,8 @@ struct Cache {
     int        stop;
     atomic_int abort_flag; /* polled inside the decoder so quitting is prompt */
 
-    pthread_t *threads;
-    int        n_threads;
+    RpThread *threads;
+    int       n_threads;
 
     void (*wakeup)(void *);
     void  *wakeup_ud;
@@ -179,33 +179,33 @@ static void insert_locked(Cache *c, int f, Image *im)
 
 /* ---- loader threads ----------------------------------------------------- */
 
-static void *worker_main(void *arg)
+static void worker_main(void *arg)
 {
     Cache *c = arg;
     DecodeScratch *scratch = decode_scratch_create();
     char err[256];
 
     for (;;) {
-        pthread_mutex_lock(&c->mu);
+        rp_mutex_lock(&c->mu);
         int f = -1;
         for (;;) {
             if (c->stop) break;
             f = pick_locked(c);
             if (f >= 0) break;
-            pthread_cond_wait(&c->cv, &c->mu);
+            rp_cond_wait(&c->cv, &c->mu);
         }
         if (c->stop) {
-            pthread_mutex_unlock(&c->mu);
+            rp_mutex_unlock(&c->mu);
             break;
         }
         atomic_store_explicit(&c->entries[f].state, CACHE_LOADING, memory_order_relaxed);
         c->n_loading++;
         const char *path = c->seq->frames[f].path; /* sequence is immutable */
-        pthread_mutex_unlock(&c->mu);
+        rp_mutex_unlock(&c->mu);
 
         Image *im = reader_load(path, c->lut, scratch, &c->abort_flag, err, sizeof err);
 
-        pthread_mutex_lock(&c->mu);
+        rp_mutex_lock(&c->mu);
         c->n_loading--;
         if (im) {
             insert_locked(c, f, im);
@@ -220,8 +220,8 @@ static void *worker_main(void *arg)
         }
         void (*wakeup)(void *) = c->wakeup;
         void *wakeup_ud = c->wakeup_ud;
-        pthread_cond_broadcast(&c->cv);
-        pthread_mutex_unlock(&c->mu);
+        rp_cond_broadcast(&c->cv);
+        rp_mutex_unlock(&c->mu);
 
         /* Called outside the lock: it pushes an event into the windowing
          * layer, which takes locks of its own. */
@@ -229,7 +229,6 @@ static void *worker_main(void *arg)
     }
 
     decode_scratch_destroy(scratch);
-    return NULL;
 }
 
 /* ---- public API --------------------------------------------------------- */
@@ -272,23 +271,23 @@ Cache *cache_create(const Sequence *seq, const ColorLUT *lut,
     }
     atomic_init(&c->abort_flag, 0);
 
-    pthread_mutex_init(&c->mu, NULL);
-    pthread_cond_init(&c->cv, NULL);
+    rp_mutex_init(&c->mu);
+    rp_cond_init(&c->cv);
 
     c->threads = rp_xcalloc((size_t)n_workers, sizeof *c->threads);
 
     /* Spawn with the lock held. Workers take it as the first thing they do, so
      * this publishes the finished cache to them and lets the final thread
      * count be written before anybody can read it. */
-    pthread_mutex_lock(&c->mu);
+    rp_mutex_lock(&c->mu);
     int started = 0;
     for (int i = 0; i < n_workers; i++) {
-        if (pthread_create(&c->threads[i], NULL, worker_main, c) != 0) break;
+        if (!rp_thread_create(&c->threads[i], worker_main, c)) break;
         started++;
     }
     c->n_threads = started;
     if (started == 0) c->stop = 1;
-    pthread_mutex_unlock(&c->mu);
+    rp_mutex_unlock(&c->mu);
 
     if (started == 0) {
         rp_log("could not start any loader threads");
@@ -303,17 +302,17 @@ void cache_destroy(Cache *c)
     if (!c) return;
 
     atomic_store(&c->abort_flag, 1);
-    pthread_mutex_lock(&c->mu);
+    rp_mutex_lock(&c->mu);
     c->stop = 1;
-    pthread_cond_broadcast(&c->cv);
-    pthread_mutex_unlock(&c->mu);
+    rp_cond_broadcast(&c->cv);
+    rp_mutex_unlock(&c->mu);
 
-    for (int i = 0; i < c->n_threads; i++) pthread_join(c->threads[i], NULL);
+    for (int i = 0; i < c->n_threads; i++) rp_thread_join(&c->threads[i]);
 
     for (int i = 0; i < c->count; i++) image_unref(c->entries[i].img);
 
-    pthread_cond_destroy(&c->cv);
-    pthread_mutex_destroy(&c->mu);
+    rp_cond_destroy(&c->cv);
+    rp_mutex_destroy(&c->mu);
     free(c->threads);
     free(c->entries);
     free(c->ready_list);
@@ -327,23 +326,23 @@ void cache_set_focus(Cache *c, int frame, int direction)
     if (direction == 0) direction = 1;
     frame = RP_CLAMP(frame, 0, c->count - 1);
 
-    pthread_mutex_lock(&c->mu);
+    rp_mutex_lock(&c->mu);
     int changed = (c->focus != frame) || (c->dir != direction);
     c->focus = frame;
     c->dir   = direction;
-    if (changed) pthread_cond_broadcast(&c->cv);
-    pthread_mutex_unlock(&c->mu);
+    if (changed) rp_cond_broadcast(&c->cv);
+    rp_mutex_unlock(&c->mu);
 }
 
 Image *cache_acquire(Cache *c, int frame)
 {
     if (!c || frame < 0 || frame >= c->count) return NULL;
 
-    pthread_mutex_lock(&c->mu);
+    rp_mutex_lock(&c->mu);
     Image *im = NULL;
     if (atomic_load_explicit(&c->entries[frame].state, memory_order_relaxed) == CACHE_READY)
         im = image_ref(c->entries[frame].img);
-    pthread_mutex_unlock(&c->mu);
+    rp_mutex_unlock(&c->mu);
     return im;
 }
 
@@ -358,23 +357,23 @@ void cache_get_stats(Cache *c, CacheStats *out)
     memset(out, 0, sizeof *out);
     if (!c) return;
 
-    pthread_mutex_lock(&c->mu);
+    rp_mutex_lock(&c->mu);
     out->ready       = c->ready_count;
     out->loading     = c->n_loading;
     out->failed      = c->n_failed;
     out->bytes_used  = c->bytes_used;
     out->bytes_limit = c->bytes_limit;
     out->capacity_frames = c->est_bytes ? (int)(c->bytes_limit / c->est_bytes) : 0;
-    pthread_mutex_unlock(&c->mu);
+    rp_mutex_unlock(&c->mu);
 }
 
 void cache_set_wakeup(Cache *c, void (*fn)(void *), void *userdata)
 {
     if (!c) return;
-    pthread_mutex_lock(&c->mu);
+    rp_mutex_lock(&c->mu);
     c->wakeup    = fn;
     c->wakeup_ud = userdata;
-    pthread_mutex_unlock(&c->mu);
+    rp_mutex_unlock(&c->mu);
 }
 
 const char *cache_last_error(Cache *c)

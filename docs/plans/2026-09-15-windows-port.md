@@ -66,14 +66,14 @@ entries live in this plan (see Changelog at the end) rather than in new
 scaffold files.
 
 ## Steps
-- [ ] 1. Manifest, preset, gitattributes. Test intent: `cmake --preset windows` resolves both ports.
-- [ ] 2. `platform.h`/`platform.c` with both backends. Test intent: exercised by `test_player` (threads, wait/broadcast, clock) and `test_reader` (directory listing).
-- [ ] 3. Port `cache.c`, `util.c`, `sequence.c`, `test_player.c`. Test intent: the three suites unchanged in meaning.
-- [ ] 4. CMake changes. Test intent: configure succeeds with config-mode packages; fallback branch still reads correctly.
-- [ ] 5. Release build clean at `/W4`. Test intent: zero warnings; `ramplayer.exe --help` prints usage.
-- [ ] 6. Fixture script under Git Bash; `test/` populated (seq_a, edge, sparse, mixed).
-- [ ] 7. Run the three suites; add the backslash-path case; all pass.
-- [ ] 8. README Windows section; hand over for manual check.
+- [x] 1. Manifest, preset, gitattributes. Test intent: `cmake --preset windows` resolves both ports.
+- [x] 2. `platform.h`/`platform.c` with both backends. Test intent: exercised by `test_player` (threads, wait/broadcast, clock) and `test_reader` (directory listing).
+- [x] 3. Port `cache.c`, `util.c`, `sequence.c`, `test_player.c`. Test intent: the three suites unchanged in meaning.
+- [x] 4. CMake changes. Test intent: configure succeeds with config-mode packages; fallback branch still reads correctly.
+- [x] 5. Release build clean at `/W4`. Test intent: zero warnings; `ramplayer.exe --help` prints usage. (Debug configuration also builds clean.)
+- [x] 6. Fixture script under Git Bash; `test/` populated (seq_a, edge, sparse, mixed).
+- [x] 7. Run the three suites; add the backslash-path case; all pass (test_draw 36, test_reader 70, test_player 61).
+- [x] 8. README Windows section; hand over for manual check (manual check pending).
 
 ## Tests
 **Unit:** existing `test_draw` (rasteriser), `test_reader` (decoding, sequence
@@ -88,9 +88,40 @@ tracks the mouse, the residency band fills green, `q` quits and the console
 shows no failed-frame message.
 
 ## Deviations
-(empty until implementation)
+
+### Non-ASCII paths on Windows
+**What came up:** The plan declared non-ASCII paths out of scope because the
+port used the ANSI file APIs. Self-review showed the reasoning was wrong: SDL2main
+hands `main()` UTF-8 arguments and OpenEXRCore opens paths as UTF-8, so an ANSI
+directory listing disagrees with both neighbours and even code-page-representable
+names fail in one direction or the other.
+**Options:** keep ANSI and document it; convert at the boundary and use the wide
+file APIs.
+**Chose:** the wide APIs with UTF-8 conversion inside `platform.c`, plus a fixture
+directory with non-ASCII names and a `test_reader` case that lists, expands and
+decodes from it.
+**Why:** the fix is a few lines in the one file that already owns the platform
+boundary, and it makes the Windows build consistent with what its two
+dependencies already assume.
+
+### Drive-relative paths (`C:shot.0001.exr`)
+**What came up:** Self-review noted that a drive-relative Windows path with no
+separator resolves its directory to `.` (the process directory) while the file
+itself resolved against the drive's own current directory.
+**Options:** canonicalise with `GetFullPathName` in the platform layer; special-case
+`X:` in the path splitting; leave it.
+**Chose:** leave it, documented in the README.
+**Why:** it is an unusual way to name a file and the fix either spreads platform
+conditionals into `sequence.c` or adds a canonicalisation step for every input.
+Worth revisiting if anyone hits it.
+
+### Release debug information on MSVC
+**What came up:** The upstream build sets `-O2 -g` so Release carries symbols;
+guarding that for MSVC lost the intent. **Chose:** `/Zi` and `/DEBUG` for the
+Release configuration on MSVC. The sources use no `assert`, so `NDEBUG` makes
+no difference.
 
 ## Changelog
-- CMake: new source files `src/platform.c` compiled into `ramplayer`, `test_player`, `test_reader`, `test_draw`. Dependency lookup prefers CMake config packages, pkg-config remains as fallback.
+- CMake: new source files `src/platform.c` compiled into `ramplayer`, `test_player`, `test_reader`, `test_draw`. Dependency lookup prefers CMake config packages, pkg-config remains as fallback. MSVC Release builds carry debug information.
 - Public header: `src/platform.h` added (internal to the program; no installed API).
-- Limitation: non-ASCII paths are not handled on Windows (ANSI file APIs).
+- Limitation: drive-relative paths such as `C:shot.0001.exr` are not handled on Windows; paths longer than `MAX_PATH` are subject to the same limit OpenEXRCore already has.

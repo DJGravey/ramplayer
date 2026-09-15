@@ -281,6 +281,41 @@ static void test_sequences(void)
         sequence_free(s);
     }
 
+#ifdef _WIN32
+    /* Backslash paths, as a Windows shell hands them over, split the same way
+     * as forward-slash ones: one frame expands to its whole sequence. */
+    one[0] = (char *)"test\\sparse\\shot_0001.exr";
+    s = sequence_open(one, 1, err, sizeof err);
+    CHECK(s != NULL, "a backslash path resolves: %s", err);
+    if (s) {
+        CHECK(s->count == 7, "a backslash path finds all 7 sparse frames (got %d)", s->count);
+        CHECK(strcmp(s->dir, "test\\sparse") == 0, "the directory keeps its spelling (got '%s')", s->dir);
+        sequence_free(s);
+    }
+#endif
+
+    /* Non-ASCII names go through the platform's file APIs as UTF-8. The
+     * literals below are UTF-8 (MSVC is given /utf-8 for that). */
+    one[0] = (char *)"test/unicod\xc3\xa9";
+    s = sequence_open(one, 1, err, sizeof err);
+    CHECK(s != NULL, "a non-ASCII directory resolves: %s", err);
+    if (s) {
+        CHECK(s->count == 3, "all 3 frames with non-ASCII names found (got %d)", s->count);
+        CHECK(strcmp(s->display, "\xc3\xbcn\xc3\xaf.###.exr") == 0,
+              "the display name keeps its UTF-8 (got '%s')", s->display);
+        sequence_free(s);
+    }
+    one[0] = (char *)"test/unicod\xc3\xa9/\xc3\xbcn\xc3\xaf.002.exr";
+    s = sequence_open(one, 1, err, sizeof err);
+    CHECK(s != NULL, "a non-ASCII frame path resolves: %s", err);
+    if (s) {
+        CHECK(s->count == 3, "a non-ASCII frame expands to its sequence (got %d)", s->count);
+        Image *im = s->count == 3 ? load(s->frames[1].path, err, sizeof err) : NULL;
+        CHECK(im != NULL, "a non-ASCII frame decodes: %s", im ? "" : err);
+        image_unref(im);
+        sequence_free(s);
+    }
+
     /* A file with no number in its name is a sequence of one. */
     one[0] = (char *)"test/mixed/single.exr";
     s = sequence_open(one, 1, err, sizeof err);
