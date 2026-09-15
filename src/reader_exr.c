@@ -15,11 +15,18 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "platform.h"
 #include "util.h"
 
 struct DecodeScratch {
     uint16_t *buf; /* interleaved half RGBA */
     size_t    cap; /* capacity in uint16_t elements */
+
+    /* Whole-file mode: the file being decoded, kept between loads so steady
+     * state allocates nothing. */
+    uint8_t *file;
+    size_t   file_cap;
+    size_t   file_len;
 };
 
 DecodeScratch *decode_scratch_create(void)
@@ -31,7 +38,116 @@ void decode_scratch_destroy(DecodeScratch *s)
 {
     if (!s) return;
     free(s->buf);
+    free(s->file);
     free(s);
+}
+
+/* ---- whole-file reading ---------------------------------------------------
+ * A counting semaphore of g_readers permits bounds how many files are being
+ * read at once, across every loader thread. Decoding happens outside it. */
+
+static int     g_readers;
+static int     g_permits;
+static int     g_permits_init;
+static RpMutex g_permit_mu;
+static RpCond  g_permit_cv;
+
+void reader_set_readers(int n)
+{
+    if (!g_permits_init) {
+        rp_mutex_init(&g_permit_mu);
+        rp_cond_init(&g_permit_cv);
+        g_permits_init = 1;
+    }
+    g_readers = n > 0 ? n : 0;
+    g_permits = g_readers;
+}
+
+static void permit_acquire(void)
+{
+    rp_mutex_lock(&g_permit_mu);
+    while (g_permits <= 0) rp_cond_wait(&g_permit_cv, &g_permit_mu);
+    g_permits--;
+    rp_mutex_unlock(&g_permit_mu);
+}
+
+static void permit_release(void)
+{
+    rp_mutex_lock(&g_permit_mu);
+    g_permits++;
+    rp_cond_broadcast(&g_permit_cv);
+    rp_mutex_unlock(&g_permit_mu);
+}
+
+static int aborted(const atomic_int *flag);
+
+/* Reads the whole of `path` into the scratch's file buffer. Only the read
+ * itself holds a permit; opening, sizing and growing the buffer happen
+ * outside it so the disk's time goes on transfers. */
+static int read_whole_file(const char *path, DecodeScratch *s, const atomic_int *abort_flag,
+                           char *err, size_t errsz)
+{
+    RpFile *f = rp_file_open(path);
+    if (!f) {
+        snprintf(err, errsz, "cannot open: file not found or unreadable");
+        return 0;
+    }
+    int64_t size = rp_file_size(f);
+    if (size < 0) {
+        snprintf(err, errsz, "cannot open: size unknown");
+        rp_file_close(f);
+        return 0;
+    }
+    if ((uint64_t)size > s->file_cap) {
+        /* The old contents are a previous frame; nothing to carry over. */
+        free(s->file);
+        s->file     = malloc((size_t)size);
+        s->file_cap = s->file ? (size_t)size : 0;
+        if (!s->file) {
+            snprintf(err, errsz, "out of memory for a %lld byte file", (long long)size);
+            rp_file_close(f);
+            return 0;
+        }
+    }
+
+    int ok = 0;
+    permit_acquire();
+    if (aborted(abort_flag)) {
+        /* Threads queued on the permit at quit must not each do a full read
+         * before noticing. */
+        snprintf(err, errsz, "cancelled");
+    } else if (size > 0 && !rp_file_read(f, s->file, (size_t)size)) {
+        snprintf(err, errsz, "read failed");
+    } else {
+        s->file_len = (size_t)size;
+        ok = 1;
+    }
+    permit_release();
+
+    rp_file_close(f);
+    return ok;
+}
+
+/* OpenEXRCore's stream hooks over the file buffer, with pread semantics: a
+ * request past the end returns a short count, which the library reports as a
+ * read error just as it would for a truncated file on disk. */
+static int64_t mem_read(exr_const_context_t ctxt, void *userdata, void *buffer,
+                        uint64_t sz, uint64_t offset, exr_stream_error_func_ptr_t error_cb)
+{
+    (void)ctxt;
+    (void)error_cb;
+    const DecodeScratch *s = userdata;
+    if (offset >= s->file_len) return 0;
+    uint64_t avail = s->file_len - offset;
+    if (sz > avail) sz = avail;
+    memcpy(buffer, s->file + offset, (size_t)sz);
+    return (int64_t)sz;
+}
+
+static int64_t mem_size(exr_const_context_t ctxt, void *userdata)
+{
+    (void)ctxt;
+    return (int64_t)((const DecodeScratch *)userdata)->file_len;
 }
 
 static uint16_t *scratch_get(DecodeScratch *s, size_t need_elems)
@@ -176,10 +292,18 @@ static void convert_block(Image *im, const ColorLUT *lut, const uint16_t *src,
 
 /* ---- public entry points ------------------------------------------------- */
 
-static exr_result_t open_ctx(const char *path, exr_context_t *out)
+/* With a scratch holding the file, the library decodes from memory and the
+ * path only names the file in error messages; otherwise it reads the file
+ * itself. */
+static exr_result_t open_ctx(const char *path, DecodeScratch *from_memory, exr_context_t *out)
 {
     exr_context_initializer_t init = EXR_DEFAULT_CONTEXT_INITIALIZER;
     init.error_handler_fn = quiet_error_handler;
+    if (from_memory) {
+        init.user_data = from_memory;
+        init.read_fn   = mem_read;
+        init.size_fn   = mem_size;
+    }
     return exr_start_read(out, path, &init);
 }
 
@@ -188,7 +312,7 @@ int reader_probe(const char *path, int *w, int *h, double *fps, char *err, size_
     if (fps) *fps = 0.0;
 
     exr_context_t ctxt = NULL;
-    exr_result_t rv = open_ctx(path, &ctxt);
+    exr_result_t rv = open_ctx(path, NULL, &ctxt);
     if (rv != EXR_ERR_SUCCESS) {
         fail(err, errsz, "cannot open", rv);
         return 0;
@@ -241,7 +365,17 @@ Image *reader_load(const char *path, const ColorLUT *lut, DecodeScratch *scratch
 
     if (errsz) err[0] = '\0';
 
-    rv = open_ctx(path, &ctxt);
+    DecodeScratch *from_memory = NULL;
+    if (g_readers > 0) {
+        if (aborted(abort_flag)) {
+            snprintf(err, errsz, "cancelled");
+            return NULL;
+        }
+        if (!read_whole_file(path, scratch, abort_flag, err, errsz)) return NULL;
+        from_memory = scratch;
+    }
+
+    rv = open_ctx(path, from_memory, &ctxt);
     if (rv != EXR_ERR_SUCCESS) {
         fail(err, errsz, "cannot open", rv);
         return NULL;

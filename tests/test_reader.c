@@ -352,16 +352,51 @@ static void test_sequences(void)
     sequence_free(s);
 }
 
+/* Whole-file mode keeps the file buffer between loads, so one scratch must
+ * cope with a small file, then a much larger one, then the small one again,
+ * and decode each exactly as it would fresh. */
+static void test_scratch_reuse(void)
+{
+    printf("whole-file buffer reuse\n");
+    char err[256];
+
+    Image *small = load("test/edge/plain.exr", err, sizeof err);
+    CHECK(small != NULL, "small file decodes first: %s", err);
+    if (small) CHECK(check_pattern(small, "plain"), "small file is correct before the buffer grows");
+    image_unref(small);
+
+    Image *big = load("test/seq_a/beauty.1001.exr", err, sizeof err);
+    CHECK(big != NULL, "a larger file decodes through the same scratch: %s", err);
+    if (big) CHECK(big->width == 1280 && big->height == 720, "and has its own size (got %dx%d)", big->width, big->height);
+    image_unref(big);
+
+    small = load("test/edge/plain.exr", err, sizeof err);
+    CHECK(small != NULL, "small file decodes again after the buffer grew: %s", err);
+    if (small) CHECK(check_pattern(small, "plain"), "small file is correct with a larger buffer than it needs");
+    image_unref(small);
+}
+
 int main(void)
 {
     color_lut_init(&g_lut);
     g_scratch = decode_scratch_create();
 
-    test_windows();
-    test_channel_sets();
-    test_tiled();
-    test_bad_files();
-    test_sequences();
+    /* Every decode case runs with the decoder reading the file itself (0),
+     * and in whole-file mode with one and with two permits. */
+    static const int readers[] = { 0, 1, 2 };
+    for (int i = 0; i < (int)(sizeof readers / sizeof *readers); i++) {
+        printf("== readers=%d ==\n", readers[i]);
+        reader_set_readers(readers[i]);
+        test_windows();
+        test_channel_sets();
+        test_tiled();
+        test_bad_files();
+        test_sequences();
+    }
+
+    reader_set_readers(1);
+    test_scratch_reuse();
+    reader_set_readers(0);
 
     decode_scratch_destroy(g_scratch);
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

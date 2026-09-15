@@ -13,6 +13,7 @@
 #define RP_PLATFORM_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 typedef struct { void *h; } RpMutex;  /* SRWLOCK */
@@ -66,6 +67,18 @@ void rp_dir_close(RpDir *d);
 
 int rp_is_dir(const char *path);
 int rp_is_file(const char *path);
+
+/* Whole-file reading, front to back. */
+typedef struct RpFile RpFile;
+
+/* Opens for sequential reading, or returns NULL. */
+RpFile *rp_file_open(const char *path);
+/* The file's size in bytes, or -1. */
+int64_t rp_file_size(RpFile *f);
+/* Reads exactly n bytes from the current position. Returns 1 on success, 0 if
+ * the file ended early or the read failed. */
+int  rp_file_read(RpFile *f, void *buf, size_t n);
+void rp_file_close(RpFile *f);
 
 /* Both separators count on Windows; only '/' elsewhere. */
 int rp_is_path_sep(char c);

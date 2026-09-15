@@ -72,12 +72,12 @@ Alternatives considered, one line each:
 **Dependencies added:** none.
 
 ## Steps
-- [ ] 1. `rp_file_open/size/read/close` in platform, both backends. Test intent: the UTF-8 path case in `test_reader` exercises the wide-path open in whole-file mode.
-- [ ] 2. `reader_set_readers()`; whole-file `reader_load()` reads under a permit and decodes from memory. Test intent: every `test_reader` decode case passes with readers 0, 1 and 2; `test_player` unchanged.
-- [ ] 3. `--readers` option in `main.c`. Test intent: usage text; a bad value is rejected like the other options.
-- [ ] 4. Reader-count test loop and the scratch growth case in `test_reader`.
-- [ ] 5. Benchmark: local drive with readers 0 and 1; share with readers 0, 8 and 15; 15 threads throughout, uncached ranges.
-- [ ] 6. README.
+- [x] 1. `rp_file_open/size/read/close` in platform, both backends. Test intent: the UTF-8 path case in `test_reader` exercises the wide-path open in whole-file mode.
+- [x] 2. `reader_set_readers()`; whole-file `reader_load()` reads under a permit and decodes from memory. Test intent: every `test_reader` decode case passes with readers 0, 1 and 2; `test_player` unchanged.
+- [x] 3. `--readers` option in `main.c`. Test intent: usage text; a bad value is rejected like the other options.
+- [x] 4. Reader-count test loop and the scratch growth case in `test_reader`.
+- [x] 5. Benchmark: local drive with readers 0 and 1; share with readers 0, 8 and 15; 15 threads throughout, uncached ranges. Results, frames/s at 15 threads: local drive readers 0: 5.9 to 6.2; readers 1: 12.8 to 14.4; readers 2: 9.9 to 10.9. Share readers 0: 83 to 92; readers 8: 80; readers 15: 82.
+- [x] 6. README.
 
 ## Tests
 **Unit:** `test_reader` (decode cases, damaged files, tiled, UTF-8 path, with
@@ -92,7 +92,22 @@ at the full rate. Then the share without `--readers`, to confirm the default is
 unchanged there.
 
 ## Deviations
-(empty until implementation)
+
+### Read request size on the share
+**What came up:** The first whole-file reader issued one `ReadFile` for the
+whole 12 MB. On the share that measured 59 to 66 frames/s at 4 to 15 readers,
+well under the 80 to 86 the raw benchmark had shown for whole-file reads, which
+had used 1 MB `fread` pieces.
+**Options:** keep one large request and accept the gap; read in 1 MB requests.
+**Chose:** 1 MB requests in `rp_file_read()`.
+**Why:** re-measured at 80 to 82 frames/s, within a tenth of the default. The
+SMB redirector pipelines requests of that size; one huge request does not.
+
+### Two readers on the spinning disk
+**What came up:** `--readers 2` measured 10 to 11 frames/s against 13 to 14
+for one reader on the local drive: two sequential streams still make the head
+alternate. **Chose:** no code change; the README says to use 1 on a spinning
+disk. The count exists for shares and SSDs.
 
 ## Changelog
 - `src/platform.h`: file reading functions added.

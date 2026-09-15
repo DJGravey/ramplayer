@@ -54,6 +54,7 @@ Options:
 | `--mem SIZE` | RAM budget for cached frames; default `1G`. Accepts `512M`, `4G`, … A budget too small for two frames is raised to that, since playback could not otherwise advance. |
 | `--fps RATE` | Playback rate. Defaults to the sequence's own `framesPerSecond`, else 30. |
 | `--threads N` | Loader threads; default is one per core, less one. |
+| `--readers N` | Read each frame file whole, at most `N` files at a time, and decode from memory. By default the decoder reads the file itself, chunk by chunk, with every loader thread independent. See Spinning disks below. |
 | `--scale N` | UI scale factor for HiDPI displays. |
 
 Controls:
@@ -74,6 +75,28 @@ Controls:
 
 Playback loops at both ends: running forwards past the last frame returns to
 the first, and running backwards past the first returns to the last.
+
+### Spinning disks
+
+The default loader lets the decoder read each file chunk by chunk, so several
+threads interleave small reads across several files. An SSD or a fast network
+share does not mind; measured on a 10 Gb SMB share with 12 MB frames it
+saturates the link at about 90 frames/s. A spinning disk does mind: the same
+frames from a SATA drive loaded at 6 frames/s, a third of the drive's
+sequential rate, because the head seeks between the loaders' files.
+
+`--readers 1` reads each file whole in one pass, one file at a time, and
+decodes from memory in parallel, which on that drive measured 13 to 14
+frames/s, about the drive's ceiling. Two readers measured worse than one. On
+the share, `--readers 8` or more comes within a tenth of the default, so the
+option costs little if a sequence sometimes comes from either. Each loader
+thread then keeps a buffer the size of one frame file, on top of the `--mem`
+budget.
+
+No spinning disk delivers 30 fps of 12 MB frames (360 MB/s), so on a first
+pass playback will hold at the loading rate. Playback at full rate comes from
+resident frames: give `--mem` a budget that holds the whole sequence, and the
+second pass is free.
 
 ## How it works
 
@@ -109,7 +132,9 @@ the file stores them, which turns the scene-linear to display conversion into a
 single lookup per channel against a 64 KB table instead of a `pow()` per pixel.
 Frames are decoded chunk by chunk into a small scratch buffer and converted
 into the destination image immediately, so a loader thread's working set stays
-in the tens of kilobytes rather than holding a whole float image.
+in the tens of kilobytes rather than holding a whole float image. With
+`--readers` the compressed file is held whole while it decodes, which is still
+far smaller than the float image would be.
 
 Frames are cached ready to display, as 8-bit pixels. That costs half what
 keeping half floats would, so the budget holds roughly twice as many frames,

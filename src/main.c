@@ -6,6 +6,7 @@
  * calls in app.h.
  */
 #include <SDL.h>
+#include <ctype.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -205,6 +206,9 @@ static void usage(FILE *out)
         "  --mem SIZE      RAM budget for cached frames (default 1G)\n"
         "  --fps RATE      playback rate (default 30)\n"
         "  --threads N     loader threads (default: one per core, less one)\n"
+        "  --readers N     read whole files, at most N at a time; 1 keeps a\n"
+        "                  spinning disk streaming (default 0: decode straight\n"
+        "                  from the file, which suits SSDs and fast networks)\n"
         "  --scale N       UI scale factor for HiDPI displays\n"
         "  -h, --help      this message\n"
         "\n"
@@ -219,6 +223,7 @@ typedef struct {
     double fps;
     int    fps_set; /* --fps given, so do not let the file override it */
     int    threads;
+    int    readers;
     int    scale;
     char *const *inputs;
     int    n_inputs;
@@ -230,6 +235,7 @@ static int parse_args(int argc, char **argv, Options *o)
     o->fps       = DEFAULT_FPS;
     o->fps_set   = 0;
     o->threads   = 0;
+    o->readers   = 0;
     o->scale     = 0;
 
     int i = 1;
@@ -267,6 +273,12 @@ static int parse_args(int argc, char **argv, Options *o)
             o->threads = atoi(v);
             if (o->threads < 1 || o->threads > 64) {
                 rp_log("bad --threads value '%s'", v);
+                return 0;
+            }
+        } else if (strcmp(a, "--readers") == 0) {
+            o->readers = atoi(v);
+            if (!isdigit((unsigned char)v[0]) || o->readers < 0 || o->readers > 64) {
+                rp_log("bad --readers value '%s'", v);
                 return 0;
             }
         } else if (strcmp(a, "--scale") == 0) {
@@ -412,6 +424,7 @@ int main(int argc, char **argv)
     }
 
     int threads = opt.threads > 0 ? opt.threads : default_thread_count();
+    reader_set_readers(opt.readers);
     Cache *cache = cache_create(seq, &lut, opt.mem_limit, threads,
                                 (size_t)seq->width * seq->height * 4);
     if (!cache) {

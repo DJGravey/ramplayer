@@ -22,6 +22,16 @@ typedef struct DecodeScratch DecodeScratch;
 DecodeScratch *decode_scratch_create(void);
 void           decode_scratch_destroy(DecodeScratch *s);
 
+/* How frame files are read. With n == 0 (the default) the decoder reads the
+ * file itself, chunk by chunk, and every loader thread is independent; the
+ * right shape for SSDs and fast networks. With n > 0 each file is read whole
+ * in one sequential pass, at most n files at a time across all threads, and
+ * decoded from memory; n == 1 keeps a spinning disk streaming instead of
+ * seeking between the loaders' files. Each scratch then keeps a buffer the
+ * size of the largest file it has seen, outside the frame cache's budget.
+ * Call before any loader thread starts. */
+void reader_set_readers(int n);
+
 /* Reads just the header. `fps` is optional; it receives the file's
  * framesPerSecond attribute, or 0 when the file does not carry one. */
 int reader_probe(const char *path, int *w, int *h, double *fps, char *err, size_t errsz);

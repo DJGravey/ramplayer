@@ -212,6 +212,58 @@ int rp_is_file(const char *path)
 
 int rp_is_path_sep(char c) { return c == '/' || c == '\\'; }
 
+struct RpFile {
+    HANDLE h;
+};
+
+RpFile *rp_file_open(const char *path)
+{
+    wchar_t *w = utf8_to_wide(path);
+    if (!w) return NULL;
+    /* Share everything: a frame still being written by a renderer, or held
+     * open by another viewer, must still open here as it does elsewhere. */
+    HANDLE h = CreateFileW(w, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    free(w);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    RpFile *f = malloc(sizeof *f);
+    if (!f) {
+        CloseHandle(h);
+        return NULL;
+    }
+    f->h = h;
+    return f;
+}
+
+int64_t rp_file_size(RpFile *f)
+{
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(f->h, &sz)) return -1;
+    return (int64_t)sz.QuadPart;
+}
+
+/* Reads in 1 MB requests: the SMB redirector pipelines requests of that size
+ * well, where one request for a whole 12 MB file measured a third slower. */
+int rp_file_read(RpFile *f, void *buf, size_t n)
+{
+    uint8_t *p = buf;
+    while (n > 0) {
+        DWORD want = n > (1u << 20) ? (1u << 20) : (DWORD)n;
+        DWORD got  = 0;
+        if (!ReadFile(f->h, p, want, &got, NULL) || got == 0) return 0;
+        p += got;
+        n -= got;
+    }
+    return 1;
+}
+
+void rp_file_close(RpFile *f)
+{
+    if (!f) return;
+    CloseHandle(f->h);
+    free(f);
+}
+
 #else
 
 /* ======================================================================== */
@@ -219,8 +271,11 @@ int rp_is_path_sep(char c) { return c == '/' || c == '\\'; }
 /* ======================================================================== */
 
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 /* ---- threads ------------------------------------------------------------ */
 
@@ -316,5 +371,49 @@ int rp_is_file(const char *path)
 }
 
 int rp_is_path_sep(char c) { return c == '/'; }
+
+struct RpFile {
+    int fd;
+};
+
+RpFile *rp_file_open(const char *path)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    RpFile *f = malloc(sizeof *f);
+    if (!f) {
+        close(fd);
+        return NULL;
+    }
+    f->fd = fd;
+    return f;
+}
+
+int64_t rp_file_size(RpFile *f)
+{
+    struct stat st;
+    if (fstat(f->fd, &st) != 0) return -1;
+    return (int64_t)st.st_size;
+}
+
+int rp_file_read(RpFile *f, void *buf, size_t n)
+{
+    uint8_t *p = buf;
+    while (n > 0) {
+        ssize_t got = read(f->fd, p, n);
+        if (got < 0 && errno == EINTR) continue;
+        if (got <= 0) return 0;
+        p += got;
+        n -= (size_t)got;
+    }
+    return 1;
+}
+
+void rp_file_close(RpFile *f)
+{
+    if (!f) return;
+    close(f->fd);
+    free(f);
+}
 
 #endif
