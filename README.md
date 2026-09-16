@@ -117,11 +117,19 @@ in the direction of play, wrapping at the ends because playback loops — which
 is why the cached region sits ahead of the playhead when playing forwards and
 behind it when playing backwards.
 
+What to give up is judged the other way round. Any frame behind the playhead
+is recycled before any frame ahead, and among the frames behind, the farthest
+goes first, so the frames just shown are the last to go. Reversing, or
+scrubbing back over what was just played, therefore finds those frames still
+in RAM while the loaders turn around, and the space for the new direction
+comes from the far end of the old one.
+
 A frame is only fetched if there is room for it, or if something resident is
-further from the playhead than it is. That admission rule is what keeps a full
-cache from thrashing, and the same comparison is applied again when a decoded
-frame is inserted, so a frame that became less useful while it was decoding is
-dropped rather than evicting something better.
+worth less than it, beyond what the loads already in flight will take when
+they land. That admission rule is what keeps a full cache from thrashing and
+stops one freed slot from starting a load on every thread. The same comparison
+is applied again when a decoded frame is inserted, so a frame that became less
+useful while it was decoding is dropped rather than evicting something better.
 
 Frames are reference counted. The cache holds one reference and the drawing
 code takes another while it paints, so a frame evicted mid-draw stays alive

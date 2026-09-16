@@ -38,6 +38,10 @@ typedef struct {
     size_t bytes_used;
     size_t bytes_limit;
     int    capacity_frames; /* how many frames the budget is expected to hold */
+    int    discarded;       /* decoded frames dropped on arrival because nothing
+                               resident was worth less by then; a count that
+                               grows during ordinary playback means loads are
+                               being admitted that cannot land */
 } CacheStats;
 
 typedef struct Cache Cache;

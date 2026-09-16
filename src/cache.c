@@ -34,12 +34,14 @@ struct Cache {
     size_t bytes_used;
     size_t bytes_limit;
     size_t est_bytes; /* working estimate of one frame, for admission tests */
+    int    cap_frames; /* frames the budget holds at that estimate, 2..count */
 
     int focus;
     int dir;
 
     int n_loading;
     int n_failed;
+    int n_discarded;
 
     int        stop;
     atomic_int abort_flag; /* polled inside the decoder so quitting is prompt */
@@ -54,12 +56,48 @@ struct Cache {
     int  error_count;
 };
 
-/* ---- priority ------------------------------------------------------------
- * 0 is the frame under the playhead, 1 the next one in the direction of play,
- * and so on around the loop. Higher is less valuable. */
+/* ---- distance ------------------------------------------------------------
+ * Two measures with one job each.
+ *
+ * prio_of() orders loading: 0 is the frame under the playhead, 1 the next one
+ * in the direction of play, and so on around the loop. The loaders fill in
+ * that order, so the resident region runs ahead of the playhead and no effort
+ * goes to frames behind it.
+ *
+ * score_of() decides what to give up. Higher is less valuable. A frame counts
+ * as ahead if it is within the budget's reach in the direction of play, that
+ * is, if the loaders could fill that far; it scores its distance ahead, so
+ * the nearest is kept longest. Every other frame is behind, scoring above all
+ * of those, the farthest behind highest, so the frames just shown are the
+ * last to be recycled: a reversal, or a scrub back over them, finds them still
+ * in RAM while the loaders turn around. (The original rule scored every frame
+ * by its distance ahead round the loop, which made the frame just shown the
+ * first to go.)
+ *
+ * Splitting at the budget's reach rather than at half the loop matters when
+ * the budget holds more than half the sequence: the region must still run
+ * the whole budget ahead of the playhead, and going round the loop the far
+ * end is genuinely within reach. */
 static inline int prio_of(const Cache *c, int f)
 {
     return rp_wrap((f - c->focus) * c->dir, c->count);
+}
+
+static inline int score_of(const Cache *c, int f)
+{
+    int ahead = prio_of(c, f);
+    if (ahead < c->cap_frames) return ahead;
+    return c->cap_frames + (c->count - ahead); /* behind by count - ahead */
+}
+
+/* Keeps cap_frames in step with the budget and the frame size estimate. At
+ * least 2, so the frame after the one on show always counts as ahead. */
+static void update_cap_locked(Cache *c)
+{
+    size_t est = c->est_bytes ? c->est_bytes : 1;
+    size_t cap = c->bytes_limit / est;
+    if (cap > (size_t)c->count) cap = (size_t)c->count;
+    c->cap_frames = cap < 2 ? 2 : (int)cap;
 }
 
 /* ---- resident set bookkeeping ------------------------------------------- */
@@ -80,21 +118,22 @@ static void ready_remove(Cache *c, int f)
     c->ready_pos[f] = -1;
 }
 
-/* The resident frame furthest from the playhead. The frame being displayed is
- * never a candidate. */
-static int find_victim_locked(const Cache *c, int *out_prio)
+/* The resident frame least worth keeping: the farthest behind the playhead if
+ * any is behind, else the farthest ahead. The frame being displayed is never a
+ * candidate. */
+static int find_victim_locked(const Cache *c, int *out_score)
 {
-    int best = -1, best_prio = -1;
+    int best = -1, best_score = -1;
     for (int i = 0; i < c->ready_count; i++) {
         int f = c->ready_list[i];
         if (f == c->focus) continue;
-        int p = prio_of(c, f);
-        if (p > best_prio) {
-            best_prio = p;
+        int s = score_of(c, f);
+        if (s > best_score) {
+            best_score = s;
             best = f;
         }
     }
-    *out_prio = best_prio;
+    *out_score = best_score;
     return best;
 }
 
@@ -109,11 +148,28 @@ static void evict_locked(Cache *c, int f)
     atomic_store_explicit(&e->state, CACHE_EMPTY, memory_order_relaxed);
 }
 
+/* How many resident frames are worth less than a candidate with this score,
+ * so could be given up for it. The frame being displayed never counts. */
+static int count_worse_locked(const Cache *c, int score)
+{
+    int worse = 0;
+    for (int i = 0; i < c->ready_count; i++) {
+        int f = c->ready_list[i];
+        if (f != c->focus && score_of(c, f) > score) worse++;
+    }
+    return worse;
+}
+
 /* ---- scheduling --------------------------------------------------------- */
 
 /* Picks the most valuable frame that is worth fetching right now, or -1 if
  * there is nothing useful to do. Candidates are visited in priority order, so
- * the moment one fails the admission test every later one would too. */
+ * the moment one fails the admission test every later one would too.
+ *
+ * A frame is admitted only if there will be somewhere to put it: free room,
+ * or resident frames worth less than it, beyond what the loads already in
+ * flight will take when they land. Without that count, one freed slot would
+ * start a load on every thread and all but one would be decoded for nothing. */
 static int pick_locked(Cache *c)
 {
     int n = c->count;
@@ -124,38 +180,35 @@ static int pick_locked(Cache *c)
      * before narrowing, so a very large budget cannot overflow the counter and
      * leave the scan doing nothing. */
     size_t est = c->est_bytes ? c->est_bytes : 1;
-    size_t cap_frames = c->bytes_limit / est;
-    int max_scan = (cap_frames >= (size_t)n) ? n
-                                             : (int)cap_frames + c->n_threads + 4;
+    int max_scan = (c->cap_frames >= n) ? n : c->cap_frames + c->n_threads + 4;
     if (max_scan > n) max_scan = n;
 
-    int victim_prio = -1, have_victim = 0;
+    size_t free_bytes = c->bytes_limit > c->bytes_used ? c->bytes_limit - c->bytes_used : 0;
+    size_t free_slots = free_bytes / est;
+    size_t in_flight  = (size_t)c->n_loading;
 
     for (int k = 0; k < max_scan; k++) {
         int f = rp_wrap(c->focus + c->dir * k, n);
         if (atomic_load_explicit(&c->entries[f].state, memory_order_relaxed) != CACHE_EMPTY)
             continue;
 
-        if (c->bytes_used + est <= c->bytes_limit) return f;
         if (c->ready_count == 0 && c->n_loading == 0) return f; /* one frame always fits */
+        if (free_slots > in_flight) return f;
 
-        if (!have_victim) {
-            find_victim_locked(c, &victim_prio);
-            have_victim = 1;
-        }
-        return (victim_prio > k) ? f : -1;
+        size_t worse = (size_t)count_worse_locked(c, score_of(c, f));
+        return (free_slots + worse > in_flight) ? f : -1;
     }
     return -1;
 }
 
 static void insert_locked(Cache *c, int f, Image *im)
 {
-    int k = prio_of(c, f);
+    int s = score_of(c, f);
 
     while (c->bytes_used + im->bytes > c->bytes_limit) {
-        int vprio;
-        int v = find_victim_locked(c, &vprio);
-        if (v < 0 || vprio <= k) break;
+        int vscore;
+        int v = find_victim_locked(c, &vscore);
+        if (v < 0 || vscore <= s) break;
         evict_locked(c, v);
     }
 
@@ -166,6 +219,7 @@ static void insert_locked(Cache *c, int f, Image *im)
          * immediately ask for it again. */
         image_unref(im);
         atomic_store_explicit(&c->entries[f].state, CACHE_EMPTY, memory_order_relaxed);
+        c->n_discarded++;
         return;
     }
 
@@ -174,7 +228,10 @@ static void insert_locked(Cache *c, int f, Image *im)
     ready_add(c, f);
     atomic_store_explicit(&c->entries[f].state, CACHE_READY, memory_order_release);
 
-    if (im->bytes > c->est_bytes) c->est_bytes = im->bytes;
+    if (im->bytes > c->est_bytes) {
+        c->est_bytes = im->bytes;
+        update_cap_locked(c);
+    }
 }
 
 /* ---- loader threads ----------------------------------------------------- */
@@ -261,6 +318,7 @@ Cache *cache_create(const Sequence *seq, const ColorLUT *lut,
     c->est_bytes   = est;
     c->dir         = 1;
     c->n_threads   = n_workers;
+    update_cap_locked(c);
 
     c->entries    = rp_xcalloc((size_t)c->count, sizeof *c->entries);
     c->ready_list = rp_xmalloc((size_t)c->count * sizeof *c->ready_list);
@@ -364,6 +422,7 @@ void cache_get_stats(Cache *c, CacheStats *out)
     out->bytes_used  = c->bytes_used;
     out->bytes_limit = c->bytes_limit;
     out->capacity_frames = c->est_bytes ? (int)(c->bytes_limit / c->est_bytes) : 0;
+    out->discarded   = c->n_discarded;
     rp_mutex_unlock(&c->mu);
 }
 

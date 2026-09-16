@@ -332,12 +332,147 @@ static void test_minimum_budget(const Sequence *seq, const ColorLUT *lut)
 
     app_toggle_play(&app, +1);
     CHECK(advance_one(&app), "playback can still advance on a minimal budget");
+    /* With exactly two frames of room, the frame just shown must be worth
+     * less than the next one ahead so that it is the one given up; otherwise
+     * playback would stop here for good. */
+    CHECK(advance_one(&app), "and advance again, giving up the frame just shown");
+    CHECK(advance_one(&app), "and keep advancing");
 
     CacheStats st;
     cache_get_stats(c, &st);
     CHECK(st.bytes_limit >= per_frame * 2, "the budget was raised to hold two frames");
 
     app_shutdown(&app);
+    cache_destroy(c);
+}
+
+/* Waits until no loader is busy, or gives up after the timeout. */
+static int wait_settled(Cache *c, double timeout)
+{
+    CacheStats st;
+    double t0 = rp_now();
+    do {
+        rp_sleep_ms(20);
+        cache_get_stats(c, &st);
+    } while (st.loading > 0 && rp_now() - t0 < timeout);
+    return st.loading == 0;
+}
+
+static int all_ready(Cache *c, int from, int to)
+{
+    for (int f = from; f <= to; f++)
+        if (cache_frame_state(c, f) != CACHE_READY) return 0;
+    return 1;
+}
+
+static int none_ready(Cache *c, int from, int to)
+{
+    for (int f = from; f <= to; f++)
+        if (cache_frame_state(c, f) == CACHE_READY) return 0;
+    return 1;
+}
+
+/* Plays forwards frame by frame the way the player does, waiting for each
+ * frame. The resident region must run ahead of the playhead: frames behind are
+ * given up as frames ahead are loaded, and every load admitted must land,
+ * since one freed slot should start one load, not one per thread. Then
+ * reverses: the frames given up first must be the ones farthest from the
+ * playhead, so the frames just shown are still there while the loaders turn
+ * around. That is checked as an invariant sampled while the loaders run,
+ * rather than at one instant: the surviving old frames must always be a
+ * contiguous run starting at the nearest one, which nearest-first eviction
+ * breaks on its very first eviction. */
+static void test_recycling_order(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("recycling order: farthest first\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    const int budget_frames = 20;
+    Cache *c = cache_create(seq, lut, per_frame * budget_frames, 4, per_frame);
+    CHECK(c != NULL, "cache creates with a budget of %d frames", budget_frames);
+    if (!c) return;
+
+    const int last = 40;
+    int reached = -1;
+    for (int f = 0; f <= last; f++) {
+        cache_set_focus(c, f, +1);
+        double t0 = rp_now();
+        while (cache_frame_state(c, f) != CACHE_READY && rp_now() - t0 < 10.0) rp_sleep_ms(5);
+        if (cache_frame_state(c, f) != CACHE_READY) break;
+        reached = f;
+    }
+    CHECK(reached == last, "played forwards to frame %d (got %d)", last, reached);
+    CHECK(wait_settled(c, 10.0), "loaders settle after playing");
+
+    CacheStats st;
+    cache_get_stats(c, &st);
+    CHECK(st.bytes_used <= per_frame * budget_frames, "budget holds (%zu of %zu)",
+          st.bytes_used, per_frame * budget_frames);
+
+    /* Playing forwards, the budget runs ahead: the frames behind were given up
+     * as the frames ahead came in. */
+    const int old_lo = last, old_hi = last + budget_frames - 2;
+    CHECK(all_ready(c, old_lo, old_hi), "the region ahead of the playhead (%d..%d) is resident",
+          old_lo, old_hi);
+    CHECK(none_ready(c, 0, last - 2), "the frames behind (0..%d) were given up", last - 2);
+    CHECK(st.discarded == 0, "every load admitted while playing landed (%d discarded)", st.discarded);
+
+    /* Reverse. While the loaders refill behind, sample the old region: reading
+     * it in increasing order, farthest-first eviction can only ever show a
+     * run of resident frames from old_lo up to some point, then nothing. */
+    cache_set_focus(c, last - 1, -1);
+    int prefix_always = 1, partial_seen = 0, resident = -1;
+    double t0 = rp_now();
+    while (rp_now() - t0 < 10.0) {
+        resident = 0;
+        int prefix = 1;
+        for (int f = old_lo; f <= old_hi; f++) {
+            int ready = cache_frame_state(c, f) == CACHE_READY;
+            if (ready && f != old_lo + resident) prefix = 0;
+            if (ready) resident++;
+        }
+        if (!prefix) prefix_always = 0;
+        if (resident > 0 && resident < old_hi - old_lo + 1) partial_seen = 1;
+        if (resident == 0) break;
+        rp_sleep_ms(2);
+    }
+    CHECK(resident == 0, "after reversing, the old region is eventually recycled (%d left)", resident);
+    CHECK(partial_seen, "the refill was observed in progress");
+    CHECK(prefix_always, "the old region was always given up from its far end first");
+    CHECK(all_ready(c, last - 8, last - 1), "frames %d..%d behind the reversal loaded", last - 8, last - 1);
+
+    cache_destroy(c);
+}
+
+/* A budget holding more than half the sequence must still run the whole
+ * budget ahead of the playhead while playing forwards; the frames just shown
+ * are given up for frames farther ahead even past the midpoint of the loop. */
+static void test_large_budget_runs_ahead(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("a budget over half the sequence still runs ahead\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    const int budget_frames = seq->count / 2 + 8; /* 56 of 96 */
+    Cache *c = cache_create(seq, lut, per_frame * budget_frames, 4, per_frame);
+    CHECK(c != NULL, "cache creates with a budget of %d frames", budget_frames);
+    if (!c) return;
+
+    const int last = 24;
+    int reached = -1;
+    for (int f = 0; f <= last; f++) {
+        cache_set_focus(c, f, +1);
+        double t0 = rp_now();
+        while (cache_frame_state(c, f) != CACHE_READY && rp_now() - t0 < 10.0) rp_sleep_ms(5);
+        if (cache_frame_state(c, f) != CACHE_READY) break;
+        reached = f;
+    }
+    CHECK(reached == last, "played forwards to frame %d (got %d)", last, reached);
+    CHECK(wait_settled(c, 10.0), "loaders settle after playing");
+
+    CHECK(all_ready(c, last, last + budget_frames - 1),
+          "the whole budget (%d..%d) is ahead of the playhead", last, last + budget_frames - 1);
+    CHECK(none_ready(c, 0, last - 1), "the frames behind (0..%d) were given up", last - 1);
+
     cache_destroy(c);
 }
 
@@ -447,6 +582,8 @@ int main(int argc, char **argv)
 
     test_memory_budget(seq, &lut);
     test_minimum_budget(seq, &lut);
+    test_recycling_order(seq, &lut);
+    test_large_budget_runs_ahead(seq, &lut);
     test_scrub_stress(seq, &lut);
 
     sequence_free(seq);
