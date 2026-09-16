@@ -443,13 +443,28 @@ void ui_draw(Surface *s, App *a)
 
     int state = cache_frame_state(a->cache, a->current);
     if (state == CACHE_FAILED) {
+        /* The picture underneath is a stand-in too, so say which. */
         char msg[256];
-        snprintf(msg, sizeof msg, "FRAME %ld FAILED TO LOAD",
-                 a->seq->frames[a->current].number);
+        if (a->shown && a->shown_frame != a->current)
+            snprintf(msg, sizeof msg, "FRAME %ld FAILED TO LOAD, SHOWING %ld",
+                     a->seq->frames[a->current].number,
+                     a->seq->frames[a->shown_frame].number);
+        else
+            snprintf(msg, sizeof msg, "FRAME %ld FAILED TO LOAD",
+                     a->seq->frames[a->current].number);
         draw_badge(s, L->viewport, msg, COL_FAILED, COL_WHITE);
     } else if (a->shown_frame != a->current || !a->shown) {
-        draw_badge(s, L->viewport, a->shown ? "LOADING" : "LOADING FIRST FRAME",
-                   RP_RGB(0x20, 0x24, 0x2c), COL_TEXT);
+        /* The image on screen is a stand-in: the nearest frame that is in
+         * RAM. Say which, so a scrub into unloaded frames reads as tracking
+         * rather than stuck. */
+        char msg[96];
+        if (a->shown)
+            snprintf(msg, sizeof msg, "LOADING %ld, SHOWING %ld",
+                     a->seq->frames[a->current].number,
+                     a->seq->frames[a->shown_frame].number);
+        else
+            snprintf(msg, sizeof msg, "LOADING FIRST FRAME");
+        draw_badge(s, L->viewport, msg, RP_RGB(0x20, 0x24, 0x2c), COL_TEXT);
     }
 
     if (a->show_help) draw_help(s, a);

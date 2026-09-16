@@ -36,9 +36,25 @@ void reader_set_readers(int n);
  * framesPerSecond attribute, or 0 when the file does not carry one. */
 int reader_probe(const char *path, int *w, int *h, double *fps, char *err, size_t errsz);
 
+/* Values for the abort flag reader_load() polls. A soft cancel is honoured
+ * only while less than half the chunks are decoded: past that, finishing is
+ * cheaper than decoding the frame again, and the frame is useful when it
+ * lands. A hard cancel stops at the next chunk regardless. */
+enum {
+    READER_CANCEL_NONE = 0,
+    READER_CANCEL_SOFT = 1,
+    READER_CANCEL_HARD = 2
+};
+
+/* The `err` text reader_load() returns when it stopped for a cancel rather
+ * than failed. Callers compare against it: the flag alone cannot say whether
+ * the decoder honoured a soft cancel or failed afterwards for real. */
+#define READER_ERR_CANCELLED "cancelled"
+
 /* Decodes `path`. Returns NULL and fills `err` on failure. If `abort_flag` is
- * non-NULL it is polled between chunks so a quitting app does not have to wait
- * out a large file. */
+ * non-NULL it is polled between chunks, so a quitting app does not have to
+ * wait out a large file and a frame the playhead has left can be abandoned
+ * early; see the READER_CANCEL values. */
 Image *reader_load(const char *path, const ColorLUT *lut, DecodeScratch *scratch,
                    const atomic_int *abort_flag, char *err, size_t errsz);
 

@@ -14,6 +14,19 @@ typedef struct {
     Image                *img;   /* owned by the cache while state == READY */
 } Entry;
 
+/* One per loader thread. `frame` is what the thread is decoding, -1 when
+ * idle, written and read under the cache lock. `abort` is the flag the decoder
+ * polls between chunks: raised under the lock by cache_set_focus() when the
+ * frame has fallen out of reach, and by cache_destroy() on the way out. */
+typedef struct {
+    Cache     *cache;
+    int        frame;
+    atomic_int abort;
+    int        just_aborted; /* the last decode was abandoned; this one is
+                                allowed to finish, so a playhead that never
+                                stops moving cannot starve the cache */
+} Worker;
+
 struct Cache {
     const Sequence *seq;
     const ColorLUT *lut;
@@ -42,11 +55,12 @@ struct Cache {
     int n_loading;
     int n_failed;
     int n_discarded;
+    int n_aborted;
 
-    int        stop;
-    atomic_int abort_flag; /* polled inside the decoder so quitting is prompt */
+    int stop;
 
     RpThread *threads;
+    Worker   *workers;
     int       n_threads;
 
     void (*wakeup)(void *);
@@ -98,6 +112,25 @@ static void update_cap_locked(Cache *c)
     size_t cap = c->bytes_limit / est;
     if (cap > (size_t)c->count) cap = (size_t)c->count;
     c->cap_frames = cap < 2 ? 2 : (int)cap;
+}
+
+/* How far ahead of the playhead the loaders look: the budget's reach plus
+ * enough slack to keep every thread busy, never past the sequence. cap_frames
+ * is at most count, so the sum cannot overflow. */
+static int reach_locked(const Cache *c)
+{
+    return RP_MIN(c->cap_frames + c->n_threads + 4, c->count);
+}
+
+/* A decode in progress is stale when its frame is at least the loaders' reach
+ * from the playhead in both directions. Measured both ways rather than in the
+ * direction of play, so that reversing over the frames just ahead lets them
+ * finish and land, where they are admitted anyway; only a genuine jump
+ * abandons work. */
+static int stale_locked(const Cache *c, int f)
+{
+    int ahead = prio_of(c, f);
+    return RP_MIN(ahead, c->count - ahead) >= reach_locked(c);
 }
 
 /* ---- resident set bookkeeping ------------------------------------------- */
@@ -180,8 +213,7 @@ static int pick_locked(Cache *c)
      * before narrowing, so a very large budget cannot overflow the counter and
      * leave the scan doing nothing. */
     size_t est = c->est_bytes ? c->est_bytes : 1;
-    int max_scan = (c->cap_frames >= n) ? n : c->cap_frames + c->n_threads + 4;
-    if (max_scan > n) max_scan = n;
+    int max_scan = reach_locked(c);
 
     size_t free_bytes = c->bytes_limit > c->bytes_used ? c->bytes_limit - c->bytes_used : 0;
     size_t free_slots = free_bytes / est;
@@ -238,7 +270,8 @@ static void insert_locked(Cache *c, int f, Image *im)
 
 static void worker_main(void *arg)
 {
-    Cache *c = arg;
+    Worker *w = arg;
+    Cache  *c = w->cache;
     DecodeScratch *scratch = decode_scratch_create();
     char err[256];
 
@@ -249,6 +282,10 @@ static void worker_main(void *arg)
             if (c->stop) break;
             f = pick_locked(c);
             if (f >= 0) break;
+            /* Going idle means nothing near the playhead is wanted, so the
+             * exemption below has done its job; a later decode may be
+             * abandoned again. */
+            w->just_aborted = 0;
             rp_cond_wait(&c->cv, &c->mu);
         }
         if (c->stop) {
@@ -257,19 +294,35 @@ static void worker_main(void *arg)
         }
         atomic_store_explicit(&c->entries[f].state, CACHE_LOADING, memory_order_relaxed);
         c->n_loading++;
+        w->frame = f;
+        atomic_store_explicit(&w->abort, 0, memory_order_relaxed);
         const char *path = c->seq->frames[f].path; /* sequence is immutable */
         rp_mutex_unlock(&c->mu);
 
-        Image *im = reader_load(path, c->lut, scratch, &c->abort_flag, err, sizeof err);
+        Image *im = reader_load(path, c->lut, scratch, &w->abort, err, sizeof err);
 
         rp_mutex_lock(&c->mu);
         c->n_loading--;
+        w->frame = -1;
         if (im) {
+            /* A frame that finished despite a soft cancel is admitted like
+             * any other; insert_locked() drops it if nothing resident is worth
+             * less. */
             insert_locked(c, f, im);
+            w->just_aborted = 0;
         } else if (c->stop) {
             /* Cancelled on the way out; not a real failure. */
             atomic_store_explicit(&c->entries[f].state, CACHE_EMPTY, memory_order_relaxed);
+        } else if (strcmp(err, READER_ERR_CANCELLED) == 0) {
+            /* The playhead left this frame behind and the decoder stopped;
+             * the loop picks a frame that matters now. Judged by what the
+             * decoder reports, not by the flag: a real failure after a cancel
+             * it chose to ignore is still a failure. */
+            atomic_store_explicit(&c->entries[f].state, CACHE_EMPTY, memory_order_relaxed);
+            c->n_aborted++;
+            w->just_aborted = 1;
         } else {
+            w->just_aborted = 0;
             atomic_store_explicit(&c->entries[f].state, CACHE_FAILED, memory_order_relaxed);
             c->n_failed++;
             if (c->error_count++ == 0)
@@ -327,12 +380,17 @@ Cache *cache_create(const Sequence *seq, const ColorLUT *lut,
         atomic_init(&c->entries[i].state, CACHE_EMPTY);
         c->ready_pos[i] = -1;
     }
-    atomic_init(&c->abort_flag, 0);
 
     rp_mutex_init(&c->mu);
     rp_cond_init(&c->cv);
 
     c->threads = rp_xcalloc((size_t)n_workers, sizeof *c->threads);
+    c->workers = rp_xcalloc((size_t)n_workers, sizeof *c->workers);
+    for (int i = 0; i < n_workers; i++) {
+        c->workers[i].cache = c;
+        c->workers[i].frame = -1;
+        atomic_init(&c->workers[i].abort, 0);
+    }
 
     /* Spawn with the lock held. Workers take it as the first thing they do, so
      * this publishes the finished cache to them and lets the final thread
@@ -340,7 +398,7 @@ Cache *cache_create(const Sequence *seq, const ColorLUT *lut,
     rp_mutex_lock(&c->mu);
     int started = 0;
     for (int i = 0; i < n_workers; i++) {
-        if (!rp_thread_create(&c->threads[i], worker_main, c)) break;
+        if (!rp_thread_create(&c->threads[i], worker_main, &c->workers[i])) break;
         started++;
     }
     c->n_threads = started;
@@ -359,9 +417,12 @@ void cache_destroy(Cache *c)
 {
     if (!c) return;
 
-    atomic_store(&c->abort_flag, 1);
     rp_mutex_lock(&c->mu);
     c->stop = 1;
+    /* Under the lock, so a worker cannot start a new decode (and reset its
+     * flag) between the flag being raised and it seeing stop. */
+    for (int i = 0; i < c->n_threads; i++)
+        atomic_store_explicit(&c->workers[i].abort, READER_CANCEL_HARD, memory_order_relaxed);
     rp_cond_broadcast(&c->cv);
     rp_mutex_unlock(&c->mu);
 
@@ -372,6 +433,7 @@ void cache_destroy(Cache *c)
     rp_cond_destroy(&c->cv);
     rp_mutex_destroy(&c->mu);
     free(c->threads);
+    free(c->workers);
     free(c->entries);
     free(c->ready_list);
     free(c->ready_pos);
@@ -388,7 +450,19 @@ void cache_set_focus(Cache *c, int frame, int direction)
     int changed = (c->focus != frame) || (c->dir != direction);
     c->focus = frame;
     c->dir   = direction;
-    if (changed) rp_cond_broadcast(&c->cv);
+    if (changed) {
+        /* Decodes the playhead has left out of reach are abandoned so the
+         * thread can take a frame near the new position: a soft cancel, so
+         * one past half way finishes instead, and never two in a row on one
+         * thread. n_loading stays as it is: the thread is busy until it
+         * returns. */
+        for (int i = 0; i < c->n_threads; i++) {
+            Worker *w = &c->workers[i];
+            if (w->frame >= 0 && !w->just_aborted && stale_locked(c, w->frame))
+                atomic_store_explicit(&w->abort, READER_CANCEL_SOFT, memory_order_relaxed);
+        }
+        rp_cond_broadcast(&c->cv);
+    }
     rp_mutex_unlock(&c->mu);
 }
 
@@ -423,6 +497,7 @@ void cache_get_stats(Cache *c, CacheStats *out)
     out->bytes_limit = c->bytes_limit;
     out->capacity_frames = c->est_bytes ? (int)(c->bytes_limit / c->est_bytes) : 0;
     out->discarded   = c->n_discarded;
+    out->aborted     = c->n_aborted;
     rp_mutex_unlock(&c->mu);
 }
 

@@ -365,6 +365,14 @@ static int all_ready(Cache *c, int from, int to)
     return 1;
 }
 
+/* Polls until every frame in from..to is resident, or the timeout passes. */
+static int wait_all_ready(Cache *c, int from, int to, double timeout)
+{
+    double t0 = rp_now();
+    while (!all_ready(c, from, to) && rp_now() - t0 < timeout) rp_sleep_ms(5);
+    return all_ready(c, from, to);
+}
+
 static int none_ready(Cache *c, int from, int to)
 {
     for (int f = from; f <= to; f++)
@@ -537,6 +545,144 @@ static void test_scrub_stress(const Sequence *seq, const ColorLUT *lut)
     cache_destroy(c);
 }
 
+/* Dragging sets the loaders' direction. After a press fills the budget ahead
+ * of frame 80 in the default forward direction, dragging leftwards must turn
+ * the read-ahead round: once the loaders settle, the frames below the cursor
+ * are the resident ones and the frames above it have been given up. Without
+ * the change the direction stays forwards and the loaders fill above the
+ * cursor, which is where the drag came from. */
+static void test_drag_sets_direction(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("dragging turns the read-ahead round\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    const int budget_frames = 8;
+    Cache *c = cache_create(seq, lut, per_frame * budget_frames, 4, per_frame);
+    CHECK(c != NULL, "cache creates with a budget of %d frames", budget_frames);
+    if (!c) return;
+
+    App app;
+    app_init(&app, seq, c, 24.0);
+    app_resize(&app, WIN_W, WIN_H);
+    const Layout *L = &app.layout;
+    int n = seq->count;
+    int ty = L->track.y + L->track.h / 2;
+
+    const int start = 80, end = 70;
+    app_mouse_down(&app, ui_x_for_frame(L, start, n), ty, MOUSE_LEFT);
+    wait_all_ready(c, start, start + budget_frames - 1, 10.0);
+    wait_settled(c, 10.0);
+    CHECK(all_ready(c, start, start + budget_frames - 1),
+          "the press fills the budget ahead (%d..%d)", start, start + budget_frames - 1);
+
+    for (int f = start - 1; f >= end; f--) app_mouse_move(&app, ui_x_for_frame(L, f, n), ty, 1);
+    CHECK(app.current == end, "the drag ends on frame %d (got %d)", end, app.current);
+    CHECK(app.last_dir == -1, "a leftward drag sets the direction backwards (got %d)", app.last_dir);
+    app_mouse_up(&app, ui_x_for_frame(L, end, n), ty, MOUSE_LEFT);
+    CHECK(app.last_dir == -1, "the direction stays after release (got %d)", app.last_dir);
+
+    const int lo = end - budget_frames + 1;
+    wait_all_ready(c, lo, end, 10.0);
+    CHECK(wait_settled(c, 10.0), "loaders settle after the drag");
+    CHECK(all_ready(c, lo, end), "the budget now runs below the cursor (%d..%d)", lo, end);
+    CHECK(none_ready(c, end + 1, start + budget_frames - 1),
+          "the frames above the cursor (%d..%d) were given up", end + 1, start + budget_frames - 1);
+
+    app_shutdown(&app);
+    cache_destroy(c);
+}
+
+/* While the frame under the playhead is loading, the viewport shows the
+ * nearest resident frame rather than whatever was last on screen. With frames
+ * 0..7 resident and frame 0 on screen, pressing on a cold frame must put a
+ * nearer frame up at once, and the real frame once it lands. */
+static void test_nearest_resident_stand_in(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("nearest resident frame stands in while loading\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    const int budget_frames = 8;
+    Cache *c = cache_create(seq, lut, per_frame * budget_frames, 4, per_frame);
+    CHECK(c != NULL, "cache creates with a budget of %d frames", budget_frames);
+    if (!c) return;
+
+    App app;
+    app_init(&app, seq, c, 24.0);
+    app_resize(&app, WIN_W, WIN_H);
+    const Layout *L = &app.layout;
+    int n = seq->count;
+    int ty = L->track.y + L->track.h / 2;
+
+    wait_all_ready(c, 0, budget_frames - 1, 10.0);
+    wait_settled(c, 10.0);
+    app_update_shown(&app);
+    CHECK(app.shown && app.shown_frame == 0, "frame 0 is on screen to begin with");
+
+    const int cold = 50, edge = budget_frames - 1;
+    app_mouse_down(&app, ui_x_for_frame(L, cold, n), ty, MOUSE_LEFT);
+    app_update_shown(&app);
+    CHECK(app.shown != NULL, "something is on screen after pressing a cold frame");
+    CHECK(app.shown_frame != 0, "the stale frame 0 is not left on screen");
+    CHECK(abs(app.shown_frame - cold) <= cold - edge,
+          "the stand-in is no farther from the playhead than the nearest resident frame was (showing %d)",
+          app.shown_frame);
+    CHECK(app.current == cold, "the playhead itself is on the cold frame (got %d)", app.current);
+
+    wait_all_ready(c, cold, cold, 10.0);
+    app_update_shown(&app);
+    CHECK(app.shown_frame == cold, "once it lands the real frame replaces the stand-in (showing %d)",
+          app.shown_frame);
+    app_mouse_up(&app, ui_x_for_frame(L, cold, n), ty, MOUSE_LEFT);
+
+    app_shutdown(&app);
+    cache_destroy(c);
+}
+
+/* A decode whose frame the playhead has jumped away from is abandoned. With
+ * one loader, sending the focus to a far frame and straight back must, over a
+ * few tries, catch the decode in progress and cancel it; the cancelled frame
+ * is left empty, not failed, and no error is reported. Each fixture frame
+ * decodes in dozens of chunks, so the poll between chunks gets its chance. */
+static void test_abort_stale_decodes(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("decodes left out of reach are abandoned\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    const int budget_frames = 8;
+    Cache *c = cache_create(seq, lut, per_frame * budget_frames, 1, per_frame);
+    CHECK(c != NULL, "cache creates with one loader");
+    if (!c) return;
+
+    cache_set_focus(c, 0, +1);
+    wait_all_ready(c, 0, budget_frames - 1, 10.0);
+    wait_settled(c, 10.0);
+
+    const int far = 50;
+    CacheStats st;
+    int tries;
+    for (tries = 0; tries < 200; tries++) {
+        cache_set_focus(c, far, +1);
+        double t0 = rp_now();
+        while (cache_frame_state(c, far) == CACHE_EMPTY && rp_now() - t0 < 1.0) { /* spin */ }
+        cache_set_focus(c, 0, +1);
+        wait_settled(c, 10.0);
+        cache_get_stats(c, &st);
+        if (st.aborted > 0) break;
+    }
+    CHECK(st.aborted > 0, "a jump away cancelled a decode in progress (%d tries)", tries + 1);
+    CHECK(st.failed == 0, "a cancelled decode is not a failure (%d failed)", st.failed);
+    CHECK(cache_last_error(c) == NULL, "a cancelled decode reports no error");
+    CHECK(cache_frame_state(c, far) == CACHE_EMPTY, "the cancelled frame is left empty (state %d)",
+          cache_frame_state(c, far));
+    CHECK(all_ready(c, 0, budget_frames - 1), "the frames around the playhead are still resident");
+
+    /* And a frame the playhead comes back to still loads. */
+    cache_set_focus(c, far, +1);
+    CHECK(wait_all_ready(c, far, far, 10.0), "the frame loads when the playhead returns to it");
+
+    cache_destroy(c);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -584,6 +730,9 @@ int main(int argc, char **argv)
     test_minimum_budget(seq, &lut);
     test_recycling_order(seq, &lut);
     test_large_budget_runs_ahead(seq, &lut);
+    test_drag_sets_direction(seq, &lut);
+    test_nearest_resident_stand_in(seq, &lut);
+    test_abort_stale_decodes(seq, &lut);
     test_scrub_stress(seq, &lut);
 
     sequence_free(seq);

@@ -79,7 +79,7 @@ static void permit_release(void)
     rp_mutex_unlock(&g_permit_mu);
 }
 
-static int aborted(const atomic_int *flag);
+static int aborted(const atomic_int *flag, int early);
 
 /* Reads the whole of `path` into the scratch's file buffer. Only the read
  * itself holds a permit; opening, sizing and growing the buffer happen
@@ -112,10 +112,11 @@ static int read_whole_file(const char *path, DecodeScratch *s, const atomic_int 
 
     int ok = 0;
     permit_acquire();
-    if (aborted(abort_flag)) {
-        /* Threads queued on the permit at quit must not each do a full read
-         * before noticing. */
-        snprintf(err, errsz, "cancelled");
+    if (aborted(abort_flag, 1)) {
+        /* Threads queued on the permit must not each do a full read of a
+         * frame nobody wants any more before noticing; nothing is done yet,
+         * so a soft cancel counts. */
+        snprintf(err, errsz, "%s", READER_ERR_CANCELLED);
     } else if (size > 0 && !rp_file_read(f, s->file, (size_t)size)) {
         snprintf(err, errsz, "read failed");
     } else {
@@ -344,9 +345,13 @@ int reader_probe(const char *path, int *w, int *h, double *fps, char *err, size_
     return 1;
 }
 
-static int aborted(const atomic_int *flag)
+/* `early` is whether less than half the work is done; a soft cancel is only
+ * honoured then. */
+static int aborted(const atomic_int *flag, int early)
 {
-    return flag && atomic_load_explicit(flag, memory_order_relaxed);
+    if (!flag) return 0;
+    int v = atomic_load_explicit(flag, memory_order_relaxed);
+    return v >= READER_CANCEL_HARD || (v == READER_CANCEL_SOFT && early);
 }
 
 Image *reader_load(const char *path, const ColorLUT *lut, DecodeScratch *scratch,
@@ -367,8 +372,8 @@ Image *reader_load(const char *path, const ColorLUT *lut, DecodeScratch *scratch
 
     DecodeScratch *from_memory = NULL;
     if (g_readers > 0) {
-        if (aborted(abort_flag)) {
-            snprintf(err, errsz, "cancelled");
+        if (aborted(abort_flag, 1)) {
+            snprintf(err, errsz, "%s", READER_ERR_CANCELLED);
             return NULL;
         }
         if (!read_whole_file(path, scratch, abort_flag, err, errsz)) return NULL;
@@ -452,8 +457,10 @@ Image *reader_load(const char *path, const ColorLUT *lut, DecodeScratch *scratch
 
         int y = dw.min.y;
         while (y <= dw.max.y) {
-            if (aborted(abort_flag)) {
-                snprintf(err, errsz, "cancelled");
+            /* In whole-file mode the read, the costly part, is already done,
+             * so a soft cancel would only throw that away. */
+            if (aborted(abort_flag, !from_memory && (y - dw.min.y) * 2 < dw.max.y - dw.min.y + 1)) {
+                snprintf(err, errsz, "%s", READER_ERR_CANCELLED);
                 goto fail_image;
             }
 
@@ -523,8 +530,8 @@ Image *reader_load(const char *path, const ColorLUT *lut, DecodeScratch *scratch
 
         for (int ty = 0; ty < nty; ty++) {
             for (int tx = 0; tx < ntx; tx++) {
-                if (aborted(abort_flag)) {
-                    snprintf(err, errsz, "cancelled");
+                if (aborted(abort_flag, !from_memory && (ty * ntx + tx) * 2 < ntx * nty)) {
+                    snprintf(err, errsz, "%s", READER_ERR_CANCELLED);
                     goto fail_image;
                 }
 

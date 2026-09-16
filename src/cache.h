@@ -42,6 +42,9 @@ typedef struct {
                                resident was worth less by then; a count that
                                grows during ordinary playback means loads are
                                being admitted that cannot land */
+    int    aborted;         /* decodes abandoned part way because the playhead
+                               jumped out of reach of the frame; the thread
+                               went to a frame that mattered instead */
 } CacheStats;
 
 typedef struct Cache Cache;
@@ -50,7 +53,10 @@ Cache *cache_create(const Sequence *seq, const ColorLUT *lut,
                     size_t byte_limit, int n_workers, size_t est_frame_bytes);
 void   cache_destroy(Cache *c);
 
-/* Tells the loaders where the playhead is and which way it is moving. */
+/* Tells the loaders where the playhead is and which way it is moving. A decode
+ * in progress whose frame is now out of the loaders' reach in both directions
+ * is abandoned, so a jump across the timeline frees the threads for the frames
+ * around the new position instead of waiting for the old ones to finish. */
 void cache_set_focus(Cache *c, int frame, int direction);
 
 /* Returns the frame with an extra reference, or NULL if it is not resident.

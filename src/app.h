@@ -46,7 +46,8 @@ struct App {
     DrawFilter filter;
 
     Image *shown;       /* image currently on screen; holds a reference */
-    int    shown_frame;
+    int    shown_frame; /* the frame `shown` is; the nearest resident one when
+                           `current` itself is not in RAM yet */
 
     int scrubbing;
     int hover_button;
@@ -72,8 +73,11 @@ void app_pause(App *a);
  * long the caller may sleep before calling again, in seconds. */
 double app_tick(App *a);
 
-/* Takes a reference on the image for the current frame, if it is resident.
- * The previous frame stays on screen until its replacement is ready. */
+/* Takes a reference on the image for the current frame, if it is resident,
+ * else on the resident frame nearest to it along the timeline, so a scrub
+ * into frames still loading shows the closest thing there is rather than the
+ * last frame that happened to be on screen. Only if nothing at all is
+ * resident does the previous image stay. */
 void app_update_shown(App *a);
 
 void app_mouse_down(App *a, int x, int y, int button);

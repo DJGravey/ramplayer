@@ -119,16 +119,36 @@ double app_tick(App *a)
     return RP_MAX(0.0, a->next_due - rp_now());
 }
 
+/* The resident frame nearest to `frame`, searching both ways along the
+ * timeline rather than round the loop, since that is how a drag moves. Ties
+ * go to the frame ahead. Returns -1 if nothing is resident. The scan reads
+ * the lock-free state array, one relaxed load per step. */
+static int nearest_resident(const App *a, int frame)
+{
+    int n = a->seq->count;
+    for (int d = 0; d < n; d++) {
+        if (frame + d < n && cache_frame_state(a->cache, frame + d) == CACHE_READY)
+            return frame + d;
+        if (d > 0 && frame - d >= 0 && cache_frame_state(a->cache, frame - d) == CACHE_READY)
+            return frame - d;
+    }
+    return -1;
+}
+
 void app_update_shown(App *a)
 {
     if (a->shown && a->shown_frame == a->current) return;
 
-    Image *im = cache_acquire(a->cache, a->current);
-    if (!im) return; /* keep the previous frame on screen while this one loads */
+    int want = nearest_resident(a, a->current);
+    if (want < 0) return; /* nothing resident at all; keep what is on screen */
+    if (a->shown && want == a->shown_frame) return;
+
+    Image *im = cache_acquire(a->cache, want);
+    if (!im) return; /* evicted since the scan; the next wake-up looks again */
 
     image_unref(a->shown);
     a->shown = im;
-    a->shown_frame = a->current;
+    a->shown_frame = want;
     a->need_redraw = 1;
 
     /* Tracked per frame rather than once, so a sequence whose frames differ
@@ -185,8 +205,13 @@ void app_mouse_move(App *a, int x, int y, int left_held)
         return;
     }
     /* x is clamped inside ui_frame_at_x, so dragging past either end of the
-     * timeline pins to the first or last frame. */
-    goto_frame(a, ui_frame_at_x(&a->layout, x, a->seq->count));
+     * timeline pins to the first or last frame. The direction of the drag
+     * becomes the cache's direction, so the loaders' read-ahead runs towards
+     * the frames the cursor is heading for; it stays after release, since
+     * those are the likely next interest. */
+    int target = ui_frame_at_x(&a->layout, x, a->seq->count);
+    if (target != a->current) a->last_dir = (target > a->current) ? 1 : -1;
+    goto_frame(a, target);
 }
 
 void app_mouse_up(App *a, int x, int y, int button)

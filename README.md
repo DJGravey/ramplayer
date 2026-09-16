@@ -108,6 +108,13 @@ in RAM, amber for frames being loaded, red for frames that failed. When the
 sequence has more frames than the timeline has pixels, each column mixes the
 residency of the frames beneath it rather than picking one.
 
+Scrubbing into frames that are not in RAM yet does not freeze the picture: the
+viewport shows the resident frame nearest the playhead, the badge names it,
+and each frame that lands nearer replaces it until the real one arrives. The
+direction of a drag becomes the loaders' direction, so the read-ahead runs
+towards the frames the cursor is heading for, and during a steady drag they
+are usually there by the time it reaches them.
+
 **The cache** (`src/cache.c`) keeps the frames nearest the playhead in memory
 within the byte budget. Rather than filling a work queue that goes stale the
 moment the user scrubs somewhere else, each loader thread asks the cache which
@@ -130,6 +137,14 @@ they land. That admission rule is what keeps a full cache from thrashing and
 stops one freed slot from starting a load on every thread. The same comparison
 is applied again when a decoded frame is inserted, so a frame that became less
 useful while it was decoding is dropped rather than evicting something better.
+A decode still in its first half when the playhead jumps out of its reach in
+both directions is abandoned, so a jump across the timeline frees the threads
+for the frames around the new position instead of waiting for the old ones to
+finish. One past half way finishes, since that is cheaper than decoding it
+again and the frame is useful when it lands; with `--readers` a frame already
+read into memory always finishes, since the read was the expensive part. No
+thread abandons two decodes in a row, so a playhead that never stops moving
+cannot starve the cache.
 
 Frames are reference counted. The cache holds one reference and the drawing
 code takes another while it paints, so a frame evicted mid-draw stays alive

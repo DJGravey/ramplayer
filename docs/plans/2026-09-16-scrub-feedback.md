@@ -42,7 +42,8 @@ and costs one relaxed atomic load per step.
 
 Cancelling: each worker owns an `_Atomic int` abort slot and records the
 frame it is decoding; `reader_load()` polls that slot between chunks exactly
-as it polls the quit flag today, so `reader.h` does not change. When the
+as it polls the quit flag today (the flag's values gained a soft/hard
+distinction later; see Deviations). When the
 focus moves, `cache_set_focus()` raises the slot of any worker whose frame is
 at least the loaders' reach (`cap_frames + n_threads + 4`, the same bound
 `pick_locked()` scans to) away in both directions. Measuring in both
@@ -59,16 +60,16 @@ Alternatives considered, one line each:
 - Cancel on distance in the direction of play: throws away frames just behind a reversed drag that would have landed and been kept.
 
 ## Files
-**Source:** `src/app.c`, `src/app.h`, `src/ui.c`, `src/cache.c`, `src/cache.h`
+**Source:** `src/app.c`, `src/app.h`, `src/ui.c`, `src/cache.c`, `src/cache.h`, `src/reader.h`, `src/reader_exr.c` (the last two per the Deviation)
 **Tests:** `tests/test_player.c`
 **Docs:** `README.md`, this plan
 **Dependencies added:** none.
 
 ## Steps
-- [ ] 1. Drag direction. Test: after a small budget fills ahead of a press, dragging leftwards frame by frame leaves the region below the cursor resident and the region above given up, and `last_dir` is -1 after release.
-- [ ] 2. Nearest-resident stand-in and badge. Test: with frames 0..k resident and the playhead dragged to a cold frame, the shown frame is resident and no resident frame is nearer; once the cold frame lands it is shown.
-- [ ] 3. Per-worker abort in the cache, raised from `cache_set_focus()`; `aborted` in `CacheStats`. Test: with one loader, jumping the focus to a far frame and straight back, repeated, cancels at least one decode; cancelled frames are EMPTY, not failed, and no error is reported.
-- [ ] 4. README.
+- [x] 1. Drag direction. Test: after a small budget fills ahead of a press, dragging leftwards frame by frame leaves the region below the cursor resident and the region above given up, and `last_dir` is -1 after release.
+- [x] 2. Nearest-resident stand-in and badge. Test: with frames 0..k resident and the playhead dragged to a cold frame, the shown frame is resident and no resident frame is nearer; once the cold frame lands it is shown.
+- [x] 3. Per-worker abort in the cache, raised from `cache_set_focus()`; `aborted` in `CacheStats`. Test: with one loader, jumping the focus to a far frame and straight back, repeated, cancels at least one decode; cancelled frames are EMPTY, not failed, and no error is reported.
+- [x] 4. README.
 
 ## Tests
 **Unit:** `test_player`: three new cases as above; existing cases unchanged.
@@ -81,3 +82,33 @@ stand-in. Drag back and forth over a loaded region and the image should
 track the cursor without lag.
 
 ## Deviations
+
+### Cancelling every stale decode starved the cache
+**What came up:** The existing scrub stress case (random focus jumps as fast
+as the loop runs) failed: nothing was ever displayed. Every decode was
+cancelled before it finished, so no frame ever landed. A fast drag on a long
+sequence with a small budget would do the same to a lesser degree, and would
+also throw away decodes that were nearly done, halving the landing rate in
+exactly the scenario this change is for.
+**Options:** leave it and slow the stress test to a realistic rate; cancel
+only in the first half of a decode (finishing is cheaper than redoing, and
+the landed frame is useful as a stand-in); never cancel twice in a row on one
+thread, so churn cannot starve the cache; both.
+**Chose:** both. `reader.h` gains `READER_CANCEL_SOFT`, honoured by the decoder
+only while less than half the chunks are done (and before the read in
+whole-file mode, where nothing is done yet), and `READER_CANCEL_HARD` for
+quitting. A worker whose last decode was cancelled lets the next one finish.
+**Why:** the soft cancel puts the sunk-cost judgement where progress is
+known, the decoder, with no timing heuristics; the once-in-a-row rule is a
+hard guarantee that at least half of all decodes land whatever the input
+does. The stress test passes unchanged.
+
+### Self-review findings (code-review, medium)
+Seven findings, all confirmed against the code and all fixed:
+- A real decode failure that happened after a soft cancel the decoder chose to ignore was classed as a cancel and never reported. The worker now judges by the decoder's own report (`READER_ERR_CANCELLED` in `reader.h`) rather than by the flag.
+- In whole-file mode (`--readers`) a soft cancel during the decode from memory threw away a read already paid for through the permit. The decoder ignores soft cancels once the file is in memory; the check before the read stays.
+- The once-in-a-row exemption was a latch that survived idle periods, so a single loader could be pinned to a useless decode long after the churn that set it. It is cleared when the worker goes idle.
+- The FAILED badge did not name the stand-in frame under it; it now does, like the LOADING badge.
+- The new tests repeated one poll loop six times; `wait_all_ready()` replaces them.
+- A duplicate `typedef struct Cache` in `cache.c`; removed.
+- A dead branch in `reach_locked()`; both it and `stale_locked()` are one `RP_MIN` now.
