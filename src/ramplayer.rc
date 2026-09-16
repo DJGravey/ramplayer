@@ -1,0 +1,3 @@
+// Windows resources. SDL uses the first icon in the executable for the
+// window and taskbar, so this one resource covers Explorer and the app.
+1 ICON "../img/ramplayer.ico"

@@ -93,6 +93,9 @@ add_executable(ramplayer
     src/ui.c
     src/app.c
 )
+if(WIN32)
+    target_sources(ramplayer PRIVATE src/ramplayer.rc)
+endif()
 rp_configure_target(ramplayer)
 target_include_directories(ramplayer PRIVATE ${RP_EXR_INCLUDE_DIRS})
 target_link_libraries(ramplayer PRIVATE ${RP_SDL2_LIBS} ${RP_EXR_LIBS})
