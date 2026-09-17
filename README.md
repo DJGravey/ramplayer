@@ -63,12 +63,17 @@ Controls:
 | --- | --- |
 | Click / drag on the timeline | pause and scrub; keeps tracking while the button is held |
 | Transport buttons | laid out left to right as previous frame, play backwards, play forwards, next frame |
-| `space` | play / pause forwards |
-| `b` | play / pause backwards |
+| Mouse wheel over the picture | zoom in or out about the cursor |
+| Drag on the picture, left or middle button | pan; playback carries on underneath |
+| `space` | pause, or play again in whichever direction last played |
+| `j` `k` `l` | play backwards / pause / play forwards |
+| `i` `o` | step one frame back / forwards (pauses first); with `Shift`, five frames |
 | `←` `→` | step one frame (pauses first) |
 | `↑` `↓`, `PgUp` `PgDn` | jump ten frames |
 | `Home` `End` | first / last frame |
-| `f` / `1` | fit to window / actual size |
+| `Backspace` | fit to window |
+| `0` | actual size, centred: black borders when the window is larger than the frame, cropped when it is smaller |
+| `f` | toggle a 1920x1080 frame guide, centred on the footage and drawn at its scale |
 | `s` | toggle smooth scaling |
 | `h` | key list |
 | `q`, `Esc` | quit |
@@ -172,6 +177,13 @@ resident. If the next frame has not arrived, the playhead and the clock both
 hold rather than racing ahead through frames nobody would see; once caching
 catches up, playback resumes at true speed.
 
+**The view** (`src/view.c`) is either fitted to the window or free: a zoom
+and the source-image point that sits at the centre of the viewport. Keeping
+the centre point rather than an offset means a resize keeps the same picture
+centred, and zooming about the cursor is a matter of moving that point so
+the pixel under the cursor stays where it is. A pan is not clamped; the frame
+can be dragged anywhere, and `Backspace` brings it back.
+
 **Drawing** composites the whole window — image, timeline, buttons, text — into
 one buffer, which is then handed over in a single upload. Scaling the frame
 into the viewport is the only part with a real cost, so it is done in two
@@ -189,6 +201,7 @@ src/
   main.c          SDL window, event loop, command line
   app.c/.h        player state, playback clock, input handling
   ui.c/.h         layout, hit testing, widget drawing
+  view.c/.h       the frame in the viewport: fitted, or zoomed and panned
   cache.c/.h      RAM frame store and loader threads
   reader_exr.c    EXR decoding (OpenEXRCore)
   sequence.c/.h   turning a path, pattern or directory into a frame list
@@ -210,6 +223,12 @@ tools/
 calls in `app.h`, which is what lets the tests drive the player without a
 window.
 
+On Windows `ramplayer.exe` is a windowed program, so no console opens beside
+the player. Started from a terminal it attaches to that terminal for its usage
+and log lines. A shell does not wait for a windowed program, so it would show
+its prompt before those lines; once startup printing is done the player posts
+an Enter to the terminal so the shell draws a fresh prompt beneath them.
+
 ## Tests
 
 ```sh
@@ -227,8 +246,8 @@ frame numbers. The test executables land in `build\windows\Release\` and are
 run from the project root the same way.
 
 `test_player` drives the same entry points the event loop calls, so the
-timeline mapping, transport buttons, looping and the memory budget are tested
-the way a user drives them. `test_reader` checks decoding against overscan,
+timeline mapping, transport buttons, keys, zoom and pan, looping and the
+memory budget are tested the way a user drives them. `test_reader` checks decoding against overscan,
 cropped, tiled, mipmapped, luminance, float and damaged files, and checks that
 a tiled file decodes to exactly the same pixels as the scanline original.
 
@@ -253,8 +272,6 @@ LeakSanitizer.
   converted, so the cache has to be refilled when it changes. Caching half
   floats instead would make it instant at the cost of holding half as many
   frames.
-- **Zoom and pan.** `draw_image()` already takes an arbitrary destination
-  rectangle, so this is mostly input handling.
 - **Audio**, which would also mean playback timing driven by the audio clock.
 
 ## License

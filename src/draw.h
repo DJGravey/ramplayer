@@ -47,6 +47,11 @@ Rect rect_center(Rect box, int iw, int ih);
 void draw_clear(Surface *s, uint32_t col);
 void draw_rect(Surface *s, Rect r, uint32_t col);
 void draw_rect_outline(Surface *s, Rect r, uint32_t col);
+/* An outline `thickness` pixels wide straddling the edge of `r`: half the
+ * band lies outside the rect and half inside (the inside gets the odd pixel),
+ * so a two-pixel frame marks the boundary without hiding what it encloses.
+ * Clipped to `clip`. */
+void draw_frame(Surface *s, Rect clip, Rect r, int thickness, uint32_t col);
 void draw_hline(Surface *s, int x, int y, int w, uint32_t col);
 void draw_vline(Surface *s, int x, int y, int h, uint32_t col);
 

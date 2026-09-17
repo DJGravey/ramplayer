@@ -95,12 +95,12 @@ Retired bindings: `f` now toggles the guide and Backspace takes its old job;
 **Dependencies added:** none.
 
 ## Steps
-- [ ] 1. Windows subsystem and console attach. Test: manual (below); `rp_console_attach()` is declared for both backends and compiles as a no-op on POSIX.
-- [ ] 2. `view.c`: `view_init()`, `view_fit()`, `view_one_to_one()`, `view_zoom_at()`, `view_pan()`, `view_rect()`, `view_scale()`. Test: fit returns `rect_fit()`; 1:1 returns `rect_center()`; zooming about a point keeps the same source pixel under it and leaves fit mode; panning moves the rect by the delta and is not clamped; zoom clamps at both limits; fit after a zoom restores the fitted rect; a resize in free mode keeps the centre point.
-- [ ] 3. Wheel and drag in `app.c`, `app_wheel()` in `app.h`, `SDL_MOUSEWHEEL` and Backspace/`0` in `main.c`, zoom in the status bar. Test: a wheel notch over the viewport zooms in about the cursor and leaves fit mode; a notch over the transport does nothing; a viewport drag pans by the delta, does not pause, and does not scrub; release ends the pan; Backspace restores fit; `0` gives 1:1.
-- [ ] 4. `resume_dir`, `app_play()`, `KEY_PLAY_FWD`/`KEY_PLAY_REV`/`KEY_PAUSE`/`KEY_STEP5_BACK`/`KEY_STEP5_FWD`, Shift in `translate_key()`, repeat for `I`/`O`. Test: `L` plays forwards and again is a no-op; `J` plays backwards; `K` pauses and a second `K` stays paused; after `J`,`K`, a rightward drag, Space plays backwards; after `L`,`K`, Space plays forwards; on a fresh player Space plays forwards; `I`/`O` pause and step ±1; Shift steps ±5 and wraps.
-- [ ] 5. `draw_frame()` and the guide. Test (`test_draw`): a frame of thickness 2 writes exactly the four bands, one pixel either side of the boundary, leaves the interior untouched, and stays inside its clip. Test (`test_player`): `F` toggles `show_guide`.
-- [ ] 6. Help overlay, `usage()`, README controls table and Not yet.
+- [x] 1. Windows subsystem and console attach. Test: manual (below); `rp_console_attach()` is declared for both backends and compiles as a no-op on POSIX.
+- [x] 2. `view.c`: `view_init()`, `view_fit()`, `view_one_to_one()`, `view_zoom_at()`, `view_pan()`, `view_rect()`, `view_scale()`. Test: fit returns `rect_fit()`; 1:1 returns `rect_center()`; zooming about a point keeps the same source pixel under it and leaves fit mode; panning moves the rect by the delta and is not clamped; zoom clamps at both limits; fit after a zoom restores the fitted rect; a resize in free mode keeps the centre point.
+- [x] 3. Wheel and drag in `app.c`, `app_wheel()` in `app.h`, `SDL_MOUSEWHEEL` and Backspace/`0` in `main.c`, zoom in the status bar. Test: a wheel notch over the viewport zooms in about the cursor and leaves fit mode; a notch over the transport does nothing; a viewport drag pans by the delta, does not pause, and does not scrub; release ends the pan; Backspace restores fit; `0` gives 1:1.
+- [x] 4. `resume_dir`, `app_play()`, `KEY_PLAY_FWD`/`KEY_PLAY_REV`/`KEY_PAUSE`/`KEY_STEP5_BACK`/`KEY_STEP5_FWD`, Shift in `translate_key()`, repeat for `I`/`O`. Test: `L` plays forwards and again is a no-op; `J` plays backwards; `K` pauses and a second `K` stays paused; after `J`,`K`, a rightward drag, Space plays backwards; after `L`,`K`, Space plays forwards; on a fresh player Space plays forwards; `I`/`O` pause and step ±1; Shift steps ±5 and wraps.
+- [x] 5. `draw_frame()` and the guide. Test (`test_draw`): a frame of thickness 2 writes exactly the four bands, one pixel either side of the boundary, leaves the interior untouched, and stays inside its clip. Test (`test_player`): `F` toggles `show_guide`.
+- [x] 6. Help overlay, `usage()`, README controls table and Not yet.
 
 ## Tests
 **Unit:** `test_player`: the view cases, the mouse cases and the key cases
@@ -119,3 +119,57 @@ Space after `J` then `K` plays backwards; `I`/`O` step, Shift+`I`/`O` step
 five, and holding them repeats; the status bar shows `FIT` or the zoom.
 
 ## Deviations
+
+### Redirected output must not be sent to the console
+**What came up:** `rp_console_attach()` as planned reopened stdout and
+stderr onto the parent console whenever one could be attached. A windowed
+process started with its output redirected (`ramplayer --help | more`, or
+`2> log.txt`) already holds valid handles for those streams, and reopening
+them would have sent the text to the screen instead of the pipe or file.
+**Options:** attach unconditionally as planned; attach only the streams that
+have no handle; skip attaching altogether and accept silent `--help`.
+**Chose:** attach only the streams that have no handle.
+**Why:** it is one `GetStdHandle()` check per stream, keeps redirection
+working exactly as the console build did, and still puts the text on the
+terminal when nothing is redirected.
+
+### Self-review findings (code-review, medium)
+One finding, confirmed and fixed: the help overlay's key column was ten
+characters wide and `LEFT/RIGHT` filled all ten, so its description sat one
+glyph right of the others. The column is eleven characters on every line now.
+The review also checked, and found correct, the zoom-about-cursor maths, the
+1:1 fast path when panned, `draw_image()` at the maximum zoom on an 8K frame,
+`draw_frame()` on rects smaller than its band, the exclusivity of pan, scrub
+and button presses, the wheel's flipped-direction handling, and the console
+attach with redirected streams.
+
+### Fix loop: the shell showed no prompt after `--help`
+**What came up:** Manual testing reported that `ramplayer.exe --help` printed
+the usage and then appeared to wait for input until Enter was pressed. The
+process had in fact exited (verified: started from PowerShell with
+`Start-Process`, it exits within the second with code 0, and code 2 on a bad
+option). A shell does not wait for a windowed program, so it drew its prompt
+at once and the usage landed beneath it, leaving the cursor with no prompt in
+sight.
+**Options:** leave it and document; ship a second console-subsystem
+`ramplayer.com` stub that waits, as mpv does; post an Enter key into the
+attached console once startup printing is done so the shell draws a fresh
+prompt.
+**Chose:** post an Enter, in a new `rp_console_prompt()`, called after the
+startup summary and on every exit before it, and only when the program
+attached to a parent console (never when output is redirected or when
+started from Explorer).
+**Why:** one function and no second executable; the terminal ends up as it
+would for a console program, with a prompt under the output. The only
+side effect is an empty line if a script launched the player and reads the
+console afterwards.
+
+### Fix loop: middle-button drag
+**What came up:** Requested during manual testing: the middle button should
+drag the picture as the left one does.
+**Options:** middle only in the viewport; middle everywhere as a pan.
+**Chose:** middle in the viewport, like the left button; on the timeline and
+the buttons it does nothing, so a scrub stays a left-button gesture.
+Buttons now pass through with SDL's numbering and a move carries a mask of
+the held drag buttons, and a pan ends only when the button that started it
+is released.

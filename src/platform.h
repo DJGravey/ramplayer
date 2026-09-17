@@ -45,6 +45,21 @@ void rp_cond_broadcast(RpCond *c);
 int  rp_thread_create(RpThread *t, void (*fn)(void *), void *arg);
 void rp_thread_join(RpThread *t);
 
+/* ---- console ------------------------------------------------------------ */
+
+/* A windowed program on Windows has no console of its own. If it was started
+ * from one, this attaches to it and points stdout and stderr there, so usage
+ * and log lines reach the terminal that ran the program. A no-op when there
+ * is no parent console (started from Explorer) and on every other platform. */
+void rp_console_attach(void);
+
+/* Call once startup printing is done. A shell does not wait for a windowed
+ * program, so it has already shown its prompt and our lines have landed
+ * beneath it, leaving the cursor with no prompt in sight. This posts an Enter
+ * to the console we attached to so the shell redraws it. A no-op unless
+ * rp_console_attach() attached to a console. */
+void rp_console_prompt(void);
+
 /* ---- time --------------------------------------------------------------- */
 
 /* The monotonic clock, rp_now(), is declared in util.h and implemented here. */

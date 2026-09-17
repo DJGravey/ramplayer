@@ -17,6 +17,7 @@
 #include "color.h"
 #include "draw.h"
 #include "font.h"
+#include "platform.h"
 #include "reader.h"
 #include "sequence.h"
 #include "ui.h"
@@ -99,18 +100,24 @@ static void present(App *app)
 
 static AppKey translate_key(const SDL_KeyboardEvent *k)
 {
+    int shift = (k->keysym.mod & KMOD_SHIFT) != 0;
     switch (k->keysym.sym) {
     case SDLK_ESCAPE: case SDLK_q:      return KEY_QUIT;
     case SDLK_SPACE:                    return KEY_SPACE;
-    case SDLK_b:                        return KEY_PLAY_BACK;
+    case SDLK_j:                        return KEY_PLAY_REV;
+    case SDLK_k:                        return KEY_PAUSE;
+    case SDLK_l:                        return KEY_PLAY_FWD;
+    case SDLK_i:                        return shift ? KEY_STEP5_BACK : KEY_LEFT;
+    case SDLK_o:                        return shift ? KEY_STEP5_FWD : KEY_RIGHT;
     case SDLK_LEFT:                     return KEY_LEFT;
     case SDLK_RIGHT:                    return KEY_RIGHT;
     case SDLK_DOWN: case SDLK_PAGEUP:   return KEY_PAGE_BACK;
     case SDLK_UP:   case SDLK_PAGEDOWN: return KEY_PAGE_FWD;
     case SDLK_HOME:                     return KEY_HOME;
     case SDLK_END:                      return KEY_END;
-    case SDLK_f:                        return KEY_FIT;
-    case SDLK_1:                        return KEY_ONE_TO_ONE;
+    case SDLK_BACKSPACE:                return KEY_FIT;
+    case SDLK_0: case SDLK_KP_0:        return KEY_ONE_TO_ONE;
+    case SDLK_f:                        return KEY_GUIDE;
     case SDLK_s:                        return KEY_FILTER;
     case SDLK_h: case SDLK_F1: case SDLK_SLASH: return KEY_HELP;
     default:                            return KEY_NONE;
@@ -121,7 +128,8 @@ static AppKey translate_key(const SDL_KeyboardEvent *k)
  * it flutter while the key is held. */
 static int key_repeats(AppKey k)
 {
-    return k == KEY_LEFT || k == KEY_RIGHT || k == KEY_PAGE_BACK || k == KEY_PAGE_FWD;
+    return k == KEY_LEFT || k == KEY_RIGHT || k == KEY_STEP5_BACK || k == KEY_STEP5_FWD ||
+           k == KEY_PAGE_BACK || k == KEY_PAGE_FWD;
 }
 
 /* SDL reports mouse positions in window coordinates; our buffer is in real
@@ -166,21 +174,33 @@ static void handle_event(App *app, const SDL_Event *e)
     case SDL_MOUSEBUTTONDOWN: {
         int x = e->button.x, y = e->button.y;
         window_to_pixels(&x, &y);
-        app_mouse_down(app, x, y, e->button.button == SDL_BUTTON_LEFT ? 1 : 2);
+        app_mouse_down(app, x, y, e->button.button);
         break;
     }
 
     case SDL_MOUSEBUTTONUP: {
         int x = e->button.x, y = e->button.y;
         window_to_pixels(&x, &y);
-        app_mouse_up(app, x, y, e->button.button == SDL_BUTTON_LEFT ? 1 : 2);
+        app_mouse_up(app, x, y, e->button.button);
         break;
     }
 
     case SDL_MOUSEMOTION: {
         int x = e->motion.x, y = e->motion.y;
         window_to_pixels(&x, &y);
-        app_mouse_move(app, x, y, (e->motion.state & SDL_BUTTON_LMASK) != 0);
+        app_mouse_move(app, x, y, (int)(e->motion.state & (SDL_BUTTON_LMASK | SDL_BUTTON_MMASK)));
+        break;
+    }
+
+    case SDL_MOUSEWHEEL: {
+        /* The wheel event carries no position on every SDL2 we build
+         * against, so ask for the pointer; it is where the wheel turned. */
+        int notches = e->wheel.y;
+        if (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) notches = -notches;
+        int x = 0, y = 0;
+        SDL_GetMouseState(&x, &y);
+        window_to_pixels(&x, &y);
+        app_wheel(app, x, y, notches);
         break;
     }
 
@@ -213,9 +233,10 @@ static void usage(FILE *out)
         "  -h, --help      this message\n"
         "\n"
         "keys:\n"
-        "  space play/pause   b play backwards   left/right step\n"
-        "  home/end ends      f fit   1 actual size   s smooth scaling\n"
-        "  h help             q quit\n");
+        "  space play/pause      j/k/l play backwards / pause / play forwards\n"
+        "  i/o step (shift: 5)   left/right step   home/end ends\n"
+        "  wheel zoom  drag pan  backspace fit  0 actual size  f 1920x1080 guide\n"
+        "  s smooth scaling      h help   q quit\n");
 }
 
 typedef struct {
@@ -246,6 +267,7 @@ static int parse_args(int argc, char **argv, Options *o)
         if (strcmp(a, "--") == 0) { i++; break; }
         if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
             usage(stdout);
+            rp_console_prompt();
             exit(0);
         }
 
@@ -300,6 +322,13 @@ static int parse_args(int argc, char **argv, Options *o)
 
 /* ---- main ---------------------------------------------------------------- */
 
+/* Leaves during startup, when a terminal may be waiting on our output. */
+static int leave(int code)
+{
+    rp_console_prompt();
+    return code;
+}
+
 static int default_thread_count(void)
 {
     int n = SDL_GetCPUCount() - 1;
@@ -330,17 +359,19 @@ static void choose_window_size(const Sequence *seq, int *w, int *h)
 
 int main(int argc, char **argv)
 {
+    rp_console_attach();
+
     Options opt;
     if (!parse_args(argc, argv, &opt)) {
         usage(stderr);
-        return 2;
+        return leave(2);
     }
 
     char err[512];
     Sequence *seq = sequence_open(opt.inputs, opt.n_inputs, err, sizeof err);
     if (!seq) {
         rp_log("%s", err);
-        return 1;
+        return leave(1);
     }
 
     /* Probe a few frames rather than only the first: one damaged frame at the
@@ -360,7 +391,7 @@ int main(int argc, char **argv)
         if (!ok) {
             rp_log("cannot read '%s': %s", seq->frames[0].path, err);
             sequence_free(seq);
-            return 1;
+            return leave(1);
         }
     }
     if (!opt.fps_set && file_fps > 0.0 && file_fps <= 1000.0) opt.fps = file_fps;
@@ -373,6 +404,8 @@ int main(int argc, char **argv)
                seq->display, seq->count, seq->width, seq->height, opt.fps, buf,
                per ? opt.mem_limit / per : 0);
     }
+    /* Startup printing is done; anything later is a rare failure. */
+    rp_console_prompt();
 
     font_init();
 

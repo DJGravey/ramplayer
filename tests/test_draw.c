@@ -267,6 +267,65 @@ static void test_fit(void)
     CHECK(c.x == 350 && c.y == 275 && c.w == 100 && c.h == 50, "centring puts it in the middle");
 }
 
+/* Counts pixels on the surface that hold `col`. */
+static int count_colour(const Surface *s, uint32_t col)
+{
+    int n = 0;
+    for (int i = 0; i < s->w * s->h; i++) if (s->px[i] == col) n++;
+    return n;
+}
+
+/* A two-pixel frame straddles the boundary of its rect: one pixel in, one
+ * out. The interior is untouched and the bands stop at the clip. */
+static void test_frame(void)
+{
+    printf("frame outline\n");
+    const uint32_t col = 0xff11ee33u;
+    Surface s = make_surface(40, 40);
+    Rect r = rect_make(10, 10, 20, 20);
+
+    draw_frame(&s, rect_make(0, 0, 40, 40), r, 2, col);
+    /* The band runs from 9 to 30 inclusive on each axis: the outer pixel is
+     * outside the rect, the inner one inside. */
+    CHECK(s.px[9 * 40 + 9] == col,   "the outer corner pixel, one outside the rect, is painted");
+    CHECK(s.px[10 * 40 + 10] == col, "the rect's own corner pixel is painted");
+    CHECK(s.px[11 * 40 + 11] == SENTINEL, "the pixel two inside the corner is not");
+    CHECK(s.px[8 * 40 + 8] == SENTINEL, "the pixel two outside the corner is not");
+    CHECK(s.px[30 * 40 + 30] == col, "the far corner is one outside the rect (29 is its last pixel)");
+    CHECK(s.px[29 * 40 + 29] == col, "and the rect's own far corner pixel is painted");
+    CHECK(s.px[28 * 40 + 28] == SENTINEL, "two inside the far corner is not");
+    CHECK(s.px[20 * 40 + 20] == SENTINEL, "the middle is untouched");
+    CHECK(count_colour(&s, col) == 22 * 22 - 18 * 18,
+          "exactly the band is painted (%d pixels, want %d)", count_colour(&s, col), 22 * 22 - 18 * 18);
+    CHECK(touched_outside(&s, rect_make(9, 9, 22, 22)) == 0, "nothing outside the band is written");
+
+    /* Clipped: only what lies inside the clip is painted. */
+    Surface c = make_surface(40, 40);
+    draw_frame(&c, rect_make(0, 0, 20, 20), r, 2, col);
+    CHECK(touched_outside(&c, rect_make(0, 0, 20, 20)) == 0, "the frame stays inside its clip");
+    CHECK(c.px[9 * 40 + 9] == col && c.px[19 * 40 + 9] == col, "the part inside the clip is painted");
+    CHECK(c.px[9 * 40 + 20] == SENTINEL, "the part outside the clip is not");
+
+    /* A thickness of 1 is the plain inside outline. */
+    Surface o = make_surface(40, 40);
+    draw_frame(&o, rect_make(0, 0, 40, 40), r, 1, col);
+    CHECK(o.px[10 * 40 + 10] == col && o.px[9 * 40 + 9] == SENTINEL && o.px[11 * 40 + 11] == SENTINEL,
+          "a one-pixel frame lies on the rect's own edge");
+    CHECK(count_colour(&o, col) == 20 * 20 - 18 * 18, "a one-pixel frame paints just the edge");
+
+    /* Nothing to draw: no crash, no pixels. */
+    Surface e = make_surface(40, 40);
+    draw_frame(&e, rect_make(0, 0, 40, 40), rect_make(5, 5, 0, 10), 2, col);
+    draw_frame(&e, rect_make(0, 0, 40, 40), r, 0, col);
+    draw_frame(&e, rect_make(0, 0, 40, 40), rect_make(-100, -100, 20, 20), 2, col);
+    CHECK(count_colour(&e, col) == 0, "empty rects, zero thickness and off-surface frames paint nothing");
+
+    free(s.px);
+    free(c.px);
+    free(o.px);
+    free(e.px);
+}
+
 int main(void)
 {
     test_one_to_one();
@@ -275,6 +334,7 @@ int main(void)
     test_monotonic_gradient();
     test_primitives();
     test_fit();
+    test_frame();
 
     draw_shutdown();
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

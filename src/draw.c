@@ -73,6 +73,22 @@ void draw_rect_outline(Surface *s, Rect r, uint32_t col)
     draw_vline(s, r.x + r.w - 1, r.y, r.h, col);
 }
 
+void draw_frame(Surface *s, Rect clip, Rect r, int thickness, uint32_t col)
+{
+    if (thickness <= 0 || r.w <= 0 || r.h <= 0) return;
+    int outside = thickness / 2;
+    Rect o = rect_make(r.x - outside, r.y - outside, r.w + 2 * outside, r.h + 2 * outside);
+    int t = thickness;
+
+    Rect bands[4] = {
+        rect_make(o.x, o.y, o.w, t),                       /* top */
+        rect_make(o.x, o.y + o.h - t, o.w, t),             /* bottom */
+        rect_make(o.x, o.y + t, t, o.h - 2 * t),           /* left */
+        rect_make(o.x + o.w - t, o.y + t, t, o.h - 2 * t), /* right */
+    };
+    for (int i = 0; i < 4; i++) draw_rect(s, rect_intersect(bands[i], clip), col);
+}
+
 /* Lerps two packed ARGB values. t runs 0..256, where 256 selects `b`. The two
  * channel pairs are kept in separate 16-bit lanes so neither can carry into
  * the other. */

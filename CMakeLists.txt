@@ -91,10 +91,16 @@ add_executable(ramplayer
     src/reader_exr.c
     src/cache.c
     src/ui.c
+    src/view.c
     src/app.c
 )
 if(WIN32)
     target_sources(ramplayer PRIVATE src/ramplayer.rc)
+    # A windowed program, so no console opens beside the player. SDL2main
+    # supplies the WinMain that calls main() with UTF-8 arguments, as its
+    # console entry point does; rp_console_attach() keeps usage and log
+    # output reaching a terminal the program was started from.
+    set_target_properties(ramplayer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 rp_configure_target(ramplayer)
 target_include_directories(ramplayer PRIVATE ${RP_EXR_INCLUDE_DIRS})
@@ -105,7 +111,7 @@ target_link_libraries(ramplayer PRIVATE ${RP_SDL2_LIBS} ${RP_EXR_LIBS})
 add_executable(test_player EXCLUDE_FROM_ALL
     tests/test_player.c
     src/platform.c src/util.c src/color.c src/image.c src/font.c src/draw.c
-    src/sequence.c src/reader_exr.c src/cache.c src/ui.c src/app.c
+    src/sequence.c src/reader_exr.c src/cache.c src/ui.c src/view.c src/app.c
 )
 rp_configure_target(test_player)
 target_include_directories(test_player PRIVATE src ${RP_EXR_INCLUDE_DIRS})

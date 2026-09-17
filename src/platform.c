@@ -2,6 +2,7 @@
 #include "platform.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -104,6 +105,55 @@ double rp_now(void)
 }
 
 void rp_sleep_ms(int ms) { Sleep(ms > 0 ? (DWORD)ms : 0); }
+
+/* ---- console ------------------------------------------------------------ */
+
+static int g_console_attached;
+
+static int std_handle_missing(DWORD which)
+{
+    HANDLE h = GetStdHandle(which);
+    return h == NULL || h == INVALID_HANDLE_VALUE;
+}
+
+void rp_console_attach(void)
+{
+    /* A stream the parent redirected (a pipe, a file) already has a handle
+     * and must keep it; only a stream with none is pointed at the console.
+     * AttachConsole fails, harmlessly, when there is no parent console or
+     * when this process already owns one (a console-subsystem build). */
+    int out = std_handle_missing(STD_OUTPUT_HANDLE);
+    int err = std_handle_missing(STD_ERROR_HANDLE);
+    if (!out && !err) return;
+    if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    g_console_attached = 1;
+    if (out && freopen("CONOUT$", "w", stdout)) setvbuf(stdout, NULL, _IONBF, 0);
+    if (err && freopen("CONOUT$", "w", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+}
+
+void rp_console_prompt(void)
+{
+    if (!g_console_attached) return;
+    HANDLE in = CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (in == INVALID_HANDLE_VALUE) return;
+
+    /* One Enter, pressed and released. The shell is sitting in its line
+     * reader, so an empty line is all it takes to draw a fresh prompt. */
+    INPUT_RECORD rec[2];
+    memset(rec, 0, sizeof rec);
+    for (int i = 0; i < 2; i++) {
+        rec[i].EventType                        = KEY_EVENT;
+        rec[i].Event.KeyEvent.bKeyDown          = (i == 0);
+        rec[i].Event.KeyEvent.wRepeatCount      = 1;
+        rec[i].Event.KeyEvent.wVirtualKeyCode   = VK_RETURN;
+        rec[i].Event.KeyEvent.wVirtualScanCode  = (WORD)MapVirtualKeyW(VK_RETURN, MAPVK_VK_TO_VSC);
+        rec[i].Event.KeyEvent.uChar.UnicodeChar = L'\r';
+    }
+    DWORD written = 0;
+    WriteConsoleInputW(in, rec, 2, &written);
+    CloseHandle(in);
+}
 
 /* ---- files -------------------------------------------------------------- */
 
@@ -323,6 +373,11 @@ void rp_sleep_ms(int ms)
     struct timespec ts = { ms / 1000, (long)(ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
 }
+
+/* ---- console ------------------------------------------------------------ */
+
+void rp_console_attach(void) { /* a terminal's stdout and stderr are already ours */ }
+void rp_console_prompt(void) { /* and the shell waits for us, so its prompt follows */ }
 
 /* ---- files -------------------------------------------------------------- */
 

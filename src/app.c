@@ -1,5 +1,6 @@
 #include "app.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "util.h"
@@ -13,7 +14,8 @@ void app_init(App *a, const Sequence *seq, Cache *cache, double fps)
     a->current     = 0;
     a->play_dir    = 0;
     a->last_dir    = 1;
-    a->fit         = 1;
+    a->resume_dir  = 1;
+    view_init(&a->view);
     a->filter      = DRAW_BILINEAR;
     a->shown_frame = -1;
     a->hover_button = -1;
@@ -72,12 +74,19 @@ void app_toggle_play(App *a, int dir)
         app_pause(a);
         return;
     }
-    a->play_dir = dir;
-    a->last_dir = dir;
-    a->stalled  = 0;
+    a->play_dir   = dir;
+    a->last_dir   = dir;
+    a->resume_dir = dir;
+    a->stalled    = 0;
     a->next_due = rp_now() + 1.0 / a->fps;
     a->need_redraw = 1;
     cache_set_focus(a->cache, a->current, a->last_dir);
+}
+
+void app_play(App *a, int dir)
+{
+    if (dir == 0) dir = 1;
+    if (a->play_dir != dir) app_toggle_play(a, dir);
 }
 
 double app_tick(App *a)
@@ -159,6 +168,14 @@ void app_update_shown(App *a)
 
 /* ---- input -------------------------------------------------------------- */
 
+/* The size of the frame the view is applied to: the one on screen, or the
+ * sequence's size before anything has landed. */
+static void frame_size(const App *a, int *iw, int *ih)
+{
+    *iw = a->shown ? a->shown->width  : a->src_w;
+    *ih = a->shown ? a->shown->height : a->src_h;
+}
+
 static void activate_button(App *a, int id)
 {
     switch (id) {
@@ -170,9 +187,23 @@ static void activate_button(App *a, int id)
     }
 }
 
+/* Starts a pan if the press is on the picture. Either drag button will do. */
+static void begin_pan(App *a, int x, int y, int button)
+{
+    if (a->panning || !rect_contains(a->layout.viewport, x, y)) return;
+    a->panning    = 1;
+    a->pan_button = button;
+    a->pan_x      = x;
+    a->pan_y      = y;
+}
+
 void app_mouse_down(App *a, int x, int y, int button)
 {
-    if (button != 1) return;
+    if (button == APP_MOUSE_MIDDLE) {
+        begin_pan(a, x, y, button);
+        return;
+    }
+    if (button != APP_MOUSE_LEFT) return;
 
     int b = ui_button_at(&a->layout, x, y);
     if (b >= 0) {
@@ -188,15 +219,35 @@ void app_mouse_down(App *a, int x, int y, int button)
         a->scrubbing = 1;
         goto_frame(a, ui_frame_at_x(&a->layout, x, a->seq->count));
         a->need_redraw = 1;
+        return;
     }
+
+    /* A drag on the picture pans it; playback carries on underneath. */
+    begin_pan(a, x, y, button);
 }
 
-void app_mouse_move(App *a, int x, int y, int left_held)
+void app_mouse_move(App *a, int x, int y, int held)
 {
     int hb = ui_button_at(&a->layout, x, y);
     if (hb != a->hover_button) {
         a->hover_button = hb;
         a->need_redraw = 1;
+    }
+
+    int left_held = (held & APP_HELD_LEFT) != 0;
+    int pan_held  = (held & (a->pan_button == APP_MOUSE_MIDDLE ? APP_HELD_MIDDLE : APP_HELD_LEFT)) != 0;
+
+    if (a->panning) {
+        if (!pan_held) {
+            a->panning = 0;
+        } else if (x != a->pan_x || y != a->pan_y) {
+            int iw, ih;
+            frame_size(a, &iw, &ih);
+            view_pan(&a->view, a->layout.viewport, iw, ih, x - a->pan_x, y - a->pan_y);
+            a->pan_x = x;
+            a->pan_y = y;
+            a->need_redraw = 1;
+        }
     }
 
     if (!a->scrubbing) return;
@@ -216,7 +267,8 @@ void app_mouse_move(App *a, int x, int y, int left_held)
 
 void app_mouse_up(App *a, int x, int y, int button)
 {
-    if (button != 1) return;
+    if (a->panning && button == a->pan_button) a->panning = 0;
+    if (button != APP_MOUSE_LEFT) return;
 
     if (a->press_button >= 0) {
         if (ui_button_at(&a->layout, x, y) == a->press_button)
@@ -227,23 +279,42 @@ void app_mouse_up(App *a, int x, int y, int button)
     a->scrubbing = 0;
 }
 
+void app_wheel(App *a, int x, int y, int notches)
+{
+    if (notches == 0 || !rect_contains(a->layout.viewport, x, y)) return;
+    int iw, ih;
+    frame_size(a, &iw, &ih);
+    view_zoom_at(&a->view, a->layout.viewport, iw, ih, x, y, pow(VIEW_WHEEL_STEP, notches));
+    a->need_redraw = 1;
+}
+
 void app_key(App *a, AppKey key)
 {
+    int iw, ih;
     switch (key) {
     case KEY_QUIT:      a->quit = 1; break;
     case KEY_SPACE:
         if (a->play_dir != 0) app_pause(a);
-        else                  app_toggle_play(a, 1);
+        else                  app_play(a, a->resume_dir);
         break;
-    case KEY_PLAY_BACK: app_toggle_play(a, -1); break;
+    case KEY_PLAY_FWD:  app_play(a, +1); break;
+    case KEY_PLAY_REV:  app_play(a, -1); break;
+    case KEY_PAUSE:     app_pause(a);    break;
     case KEY_LEFT:      app_step(a, -1);  break;
     case KEY_RIGHT:     app_step(a, +1);  break;
+    case KEY_STEP5_BACK:app_step(a, -5);  break;
+    case KEY_STEP5_FWD: app_step(a, +5);  break;
     case KEY_PAGE_BACK: app_step(a, -10); break;
     case KEY_PAGE_FWD:  app_step(a, +10); break;
     case KEY_HOME:      app_pause(a); goto_frame(a, 0); break;
     case KEY_END:       app_pause(a); goto_frame(a, a->seq->count - 1); break;
-    case KEY_FIT:       a->fit = 1; a->need_redraw = 1; break;
-    case KEY_ONE_TO_ONE:a->fit = 0; a->need_redraw = 1; break;
+    case KEY_FIT:       view_fit(&a->view); a->need_redraw = 1; break;
+    case KEY_ONE_TO_ONE:
+        frame_size(a, &iw, &ih);
+        view_one_to_one(&a->view, iw, ih);
+        a->need_redraw = 1;
+        break;
+    case KEY_GUIDE:     a->show_guide = !a->show_guide; a->need_redraw = 1; break;
     case KEY_FILTER:
         a->filter = (a->filter == DRAW_BILINEAR) ? DRAW_NEAREST : DRAW_BILINEAR;
         a->need_redraw = 1;

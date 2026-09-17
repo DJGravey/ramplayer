@@ -4,6 +4,7 @@
  * an event, so the timeline mapping, the transport buttons and the playback
  * loop are tested as the user drives them.
  */
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -235,6 +236,7 @@ static void test_playback_loops(App *a)
 static void test_keyboard(App *a)
 {
     printf("keyboard shortcuts\n");
+    int n = a->seq->count;
     app_pause(a);
     app_set_frame(a, 50);
 
@@ -251,12 +253,280 @@ static void test_keyboard(App *a)
     app_key(a, KEY_HOME);
     CHECK(a->current == 0, "home goes to the first frame");
     app_key(a, KEY_END);
-    CHECK(a->current == a->seq->count - 1, "end goes to the last frame");
+    CHECK(a->current == n - 1, "end goes to the last frame");
 
-    app_key(a, KEY_PLAY_BACK);
-    CHECK(a->play_dir == -1, "b plays backwards");
-    app_key(a, KEY_PLAY_BACK);
-    CHECK(a->play_dir == 0, "b pauses again");
+    /* J, K and L are commands, not toggles. */
+    app_key(a, KEY_PLAY_FWD);
+    CHECK(a->play_dir == +1, "L plays forwards");
+    app_key(a, KEY_PLAY_FWD);
+    CHECK(a->play_dir == +1, "L again keeps playing forwards, it is not a toggle");
+    app_key(a, KEY_PLAY_REV);
+    CHECK(a->play_dir == -1, "J plays backwards");
+    app_key(a, KEY_PLAY_REV);
+    CHECK(a->play_dir == -1, "J again keeps playing backwards");
+    app_key(a, KEY_PAUSE);
+    CHECK(a->play_dir == 0, "K pauses");
+    app_key(a, KEY_PAUSE);
+    CHECK(a->play_dir == 0, "K again stays paused, it never resumes");
+
+    /* Space resumes the direction of the last play command, and a scrub in
+     * between does not change that even though it turns the cache round. */
+    app_key(a, KEY_PLAY_REV);
+    app_key(a, KEY_PAUSE);
+    {
+        const Layout *L = &a->layout;
+        int ty = L->track.y + L->track.h / 2;
+        app_mouse_down(a, ui_x_for_frame(L, 10, n), ty, MOUSE_LEFT);
+        app_mouse_move(a, ui_x_for_frame(L, 20, n), ty, 1);
+        app_mouse_up(a, ui_x_for_frame(L, 20, n), ty, MOUSE_LEFT);
+    }
+    CHECK(a->last_dir == +1, "the rightward drag turned the cache forwards");
+    app_key(a, KEY_SPACE);
+    CHECK(a->play_dir == -1, "space after J, K and a drag plays backwards (got %d)", a->play_dir);
+    app_key(a, KEY_SPACE);
+    CHECK(a->play_dir == 0, "space pauses backwards playback");
+    app_key(a, KEY_PLAY_FWD);
+    app_key(a, KEY_PAUSE);
+    app_key(a, KEY_SPACE);
+    CHECK(a->play_dir == +1, "space after L and K plays forwards (got %d)", a->play_dir);
+    app_key(a, KEY_PAUSE);
+
+    /* The play buttons count as play commands too. */
+    click(a, btn_cx(a, BTN_PLAY_BACK), btn_cy(a, BTN_PLAY_BACK));
+    click(a, btn_cx(a, BTN_PLAY_BACK), btn_cy(a, BTN_PLAY_BACK));
+    app_key(a, KEY_SPACE);
+    CHECK(a->play_dir == -1, "space after the reverse button plays backwards (got %d)", a->play_dir);
+
+    /* I and O pause and step; with shift, five frames, wrapping like the rest. */
+    app_set_frame(a, 50);
+    app_key(a, KEY_PLAY_FWD);
+    app_key(a, KEY_STEP5_FWD);
+    CHECK(a->play_dir == 0, "shift+O pauses");
+    CHECK(a->current == 55, "shift+O steps five forwards (got %d)", a->current);
+    app_key(a, KEY_STEP5_BACK);
+    CHECK(a->current == 50, "shift+I steps five back (got %d)", a->current);
+    app_set_frame(a, 2);
+    app_key(a, KEY_STEP5_BACK);
+    CHECK(a->current == n - 3, "shift+I wraps at the start (got %d)", a->current);
+    app_key(a, KEY_STEP5_FWD);
+    CHECK(a->current == 2, "shift+O wraps at the end (got %d)", a->current);
+
+    /* The view keys. */
+    app_key(a, KEY_ONE_TO_ONE);
+    CHECK(!a->view.fit, "0 leaves fit mode");
+    {
+        Rect vp = a->layout.viewport;
+        Rect got = view_rect(&a->view, vp, a->src_w, a->src_h);
+        Rect want = rect_center(vp, a->src_w, a->src_h);
+        CHECK(got.x == want.x && got.y == want.y && got.w == want.w && got.h == want.h,
+              "0 shows the frame at 100%%, centred (%d,%d %dx%d vs %d,%d %dx%d)",
+              got.x, got.y, got.w, got.h, want.x, want.y, want.w, want.h);
+    }
+    app_key(a, KEY_FIT);
+    CHECK(a->view.fit, "backspace fits the frame to the window again");
+
+    CHECK(!a->show_guide, "the frame guide starts off");
+    app_key(a, KEY_GUIDE);
+    CHECK(a->show_guide, "F shows the frame guide");
+    app_key(a, KEY_GUIDE);
+    CHECK(!a->show_guide, "F again hides it");
+
+    /* A fresh player resumes forwards. */
+    App fresh;
+    app_init(&fresh, a->seq, a->cache, 24.0);
+    app_resize(&fresh, WIN_W, WIN_H);
+    app_key(&fresh, KEY_SPACE);
+    CHECK(fresh.play_dir == +1, "space on a fresh player plays forwards");
+    app_shutdown(&fresh);
+}
+
+/* The source pixel under screen point (mx, my) for the given view. */
+static double source_x_under(const View *v, Rect vp, int iw, int ih, int mx)
+{
+    Rect r = view_rect(v, vp, iw, ih);
+    return (mx - r.x) / view_scale(v, vp, iw, ih);
+}
+
+static double source_y_under(const View *v, Rect vp, int iw, int ih, int my)
+{
+    Rect r = view_rect(v, vp, iw, ih);
+    return (my - r.y) / view_scale(v, vp, iw, ih);
+}
+
+static int rect_eq(Rect a, Rect b)
+{
+    return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+}
+
+/* The view maths on its own: no cache, no image, just rects. */
+static void test_view(void)
+{
+    printf("view: fit, 1:1, zoom about a point, pan\n");
+    const int iw = 1280, ih = 720;
+    Rect vp = rect_make(0, 0, 1000, 600);
+    View v;
+
+    view_init(&v);
+    CHECK(rect_eq(view_rect(&v, vp, iw, ih), rect_fit(vp, iw, ih)), "a fresh view is the fitted rect");
+    CHECK(view_scale(&v, vp, iw, ih) < 1.0 && view_scale(&v, vp, iw, ih) > 0.7,
+          "the fitted scale is the fit ratio (got %.3f)", view_scale(&v, vp, iw, ih));
+
+    view_one_to_one(&v, iw, ih);
+    CHECK(rect_eq(view_rect(&v, vp, iw, ih), rect_center(vp, iw, ih)), "1:1 is the centred rect");
+    CHECK(view_scale(&v, vp, iw, ih) == 1.0, "1:1 has a scale of exactly 1");
+
+    /* Zooming in about a point keeps the source pixel under it in place. */
+    view_init(&v);
+    const int mx = 700, my = 150;
+    double sx0 = source_x_under(&v, vp, iw, ih, mx), sy0 = source_y_under(&v, vp, iw, ih, my);
+    double z0 = view_scale(&v, vp, iw, ih);
+    view_zoom_at(&v, vp, iw, ih, mx, my, VIEW_WHEEL_STEP);
+    CHECK(!v.fit, "zooming leaves fit mode");
+    CHECK(view_scale(&v, vp, iw, ih) > z0, "zooming in raises the scale (%.3f -> %.3f)", z0, v.zoom);
+    double sx1 = source_x_under(&v, vp, iw, ih, mx), sy1 = source_y_under(&v, vp, iw, ih, my);
+    CHECK(fabs(sx1 - sx0) <= 2.0 && fabs(sy1 - sy0) <= 2.0,
+          "the source pixel under the cursor stays put (%.1f,%.1f -> %.1f,%.1f)", sx0, sy0, sx1, sy1);
+    for (int i = 0; i < 8; i++) view_zoom_at(&v, vp, iw, ih, mx, my, VIEW_WHEEL_STEP);
+    double sx2 = source_x_under(&v, vp, iw, ih, mx), sy2 = source_y_under(&v, vp, iw, ih, my);
+    CHECK(fabs(sx2 - sx0) <= 2.0 && fabs(sy2 - sy0) <= 2.0,
+          "and stays put over many notches (%.1f,%.1f -> %.1f,%.1f)", sx0, sy0, sx2, sy2);
+    Rect zoomed = view_rect(&v, vp, iw, ih);
+    CHECK(zoomed.w > vp.w && zoomed.h > vp.h, "the frame now overflows the viewport");
+
+    /* Zooming out about the same point comes back to where it started. */
+    for (int i = 0; i < 9; i++) view_zoom_at(&v, vp, iw, ih, mx, my, 1.0 / VIEW_WHEEL_STEP);
+    CHECK(fabs(v.zoom - z0) < 1e-6, "nine notches out undo nine notches in (%.4f vs %.4f)", v.zoom, z0);
+    Rect back = view_rect(&v, vp, iw, ih);
+    Rect fitted = rect_fit(vp, iw, ih);
+    CHECK(abs(back.x - fitted.x) <= 1 && abs(back.y - fitted.y) <= 1 &&
+          abs(back.w - fitted.w) <= 1 && abs(back.h - fitted.h) <= 1,
+          "and the picture is back where fit put it (%d,%d %dx%d vs %d,%d %dx%d)",
+          back.x, back.y, back.w, back.h, fitted.x, fitted.y, fitted.w, fitted.h);
+
+    /* The zoom clamps at both ends rather than running away. */
+    for (int i = 0; i < 100; i++) view_zoom_at(&v, vp, iw, ih, mx, my, VIEW_WHEEL_STEP);
+    CHECK(v.zoom == VIEW_ZOOM_MAX, "zoom clamps at the maximum (got %.3f)", v.zoom);
+    for (int i = 0; i < 100; i++) view_zoom_at(&v, vp, iw, ih, mx, my, 1.0 / VIEW_WHEEL_STEP);
+    CHECK(v.zoom == VIEW_ZOOM_MIN, "zoom clamps at the minimum (got %.5f)", v.zoom);
+
+    /* Panning moves the rect by exactly the mouse delta, and is not clamped. */
+    view_init(&v);
+    Rect before = view_rect(&v, vp, iw, ih);
+    view_pan(&v, vp, iw, ih, 30, -20);
+    CHECK(!v.fit, "panning leaves fit mode");
+    Rect after = view_rect(&v, vp, iw, ih);
+    CHECK(after.x == before.x + 30 && after.y == before.y - 20 && after.w == before.w && after.h == before.h,
+          "a pan of (30,-20) moves the fitted rect by that (%d,%d -> %d,%d)",
+          before.x, before.y, after.x, after.y);
+    view_pan(&v, vp, iw, ih, 5000, 5000);
+    after = view_rect(&v, vp, iw, ih);
+    CHECK(after.x > vp.x + vp.w && after.y > vp.y + vp.h, "a pan may take the frame right off the viewport");
+    view_pan(&v, vp, iw, ih, 0, 0);
+    CHECK(rect_eq(view_rect(&v, vp, iw, ih), after), "a zero pan changes nothing");
+
+    /* Fit restores the fitted rect from anywhere. */
+    view_fit(&v);
+    CHECK(rect_eq(view_rect(&v, vp, iw, ih), rect_fit(vp, iw, ih)), "fit restores the fitted rect");
+
+    /* A resize in free mode keeps the same source point at the centre. */
+    view_one_to_one(&v, iw, ih);
+    view_pan(&v, vp, iw, ih, -100, -50);
+    double cx = v.cx, cy = v.cy;
+    Rect bigger = rect_make(0, 0, 1400, 900);
+    Rect r1 = view_rect(&v, bigger, iw, ih);
+    CHECK(v.cx == cx && v.cy == cy, "the centre point is untouched by a resize");
+    double under_cx = (bigger.x + bigger.w / 2.0 - r1.x) / v.zoom;
+    double under_cy = (bigger.y + bigger.h / 2.0 - r1.y) / v.zoom;
+    CHECK(fabs(under_cx - cx) <= 1.0 && fabs(under_cy - cy) <= 1.0,
+          "after a resize the same source point sits at the viewport centre (%.1f,%.1f vs %.1f,%.1f)",
+          under_cx, under_cy, cx, cy);
+}
+
+/* The wheel and a drag on the picture, through the same entry points the
+ * event loop uses. */
+static void test_viewport_mouse(App *a)
+{
+    printf("viewport: wheel zooms about the cursor, drag pans\n");
+    Rect vp = a->layout.viewport;
+    int iw = a->src_w, ih = a->src_h;
+
+    app_key(a, KEY_FIT);
+    app_pause(a);
+    app_set_frame(a, 30);
+
+    /* A wheel notch over the transport does nothing. */
+    Rect tr = a->layout.transport;
+    app_wheel(a, tr.x + tr.w / 2, tr.y + tr.h / 2, +1);
+    CHECK(a->view.fit, "the wheel over the transport does not zoom");
+
+    /* Over the picture it zooms in about the cursor. */
+    int mx = vp.x + vp.w * 3 / 4, my = vp.y + vp.h / 4;
+    double sx0 = source_x_under(&a->view, vp, iw, ih, mx);
+    double sy0 = source_y_under(&a->view, vp, iw, ih, my);
+    double z0 = view_scale(&a->view, vp, iw, ih);
+    app_wheel(a, mx, my, +2);
+    CHECK(!a->view.fit, "the wheel over the picture leaves fit mode");
+    CHECK(fabs(a->view.zoom - z0 * VIEW_WHEEL_STEP * VIEW_WHEEL_STEP) < 1e-9,
+          "two notches are two wheel steps (%.4f vs %.4f)", a->view.zoom, z0 * VIEW_WHEEL_STEP * VIEW_WHEEL_STEP);
+    CHECK(fabs(source_x_under(&a->view, vp, iw, ih, mx) - sx0) <= 2.0 &&
+          fabs(source_y_under(&a->view, vp, iw, ih, my) - sy0) <= 2.0,
+          "the pixel under the cursor stays under it");
+    app_wheel(a, mx, my, -2);
+    CHECK(fabs(a->view.zoom - z0) < 1e-9, "two notches back restore the scale (%.4f vs %.4f)", a->view.zoom, z0);
+    CHECK(a->need_redraw, "zooming asks for a redraw");
+
+    /* A drag on the picture pans it, and neither pauses nor scrubs. */
+    app_key(a, KEY_FIT);
+    app_key(a, KEY_PLAY_FWD);
+    int frame = a->current;
+    Rect before = view_rect(&a->view, vp, iw, ih);
+    int px = vp.x + vp.w / 2, py = vp.y + vp.h / 2;
+    app_mouse_down(a, px, py, MOUSE_LEFT);
+    app_mouse_move(a, px + 40, py + 25, 1);
+    app_mouse_move(a, px + 70, py + 15, 1);
+    Rect after = view_rect(&a->view, vp, iw, ih);
+    CHECK(!a->view.fit, "dragging the picture leaves fit mode");
+    CHECK(after.x == before.x + 70 && after.y == before.y + 15,
+          "the picture follows the drag (%d,%d -> %d,%d)", before.x, before.y, after.x, after.y);
+    CHECK(a->play_dir == +1, "dragging the picture does not pause playback");
+    CHECK(a->current == frame, "dragging the picture does not scrub (frame %d -> %d)", frame, a->current);
+    app_mouse_up(a, px + 70, py + 15, MOUSE_LEFT);
+    app_mouse_move(a, px + 200, py + 200, 0);
+    CHECK(rect_eq(view_rect(&a->view, vp, iw, ih), after), "after release, moving the mouse no longer pans");
+    app_pause(a);
+
+    /* A press on the transport does not start a pan. */
+    app_key(a, KEY_FIT);
+    app_mouse_down(a, tr.x + tr.w / 2, tr.y + 2, MOUSE_LEFT);
+    app_mouse_move(a, tr.x + tr.w / 2 + 30, tr.y + 2, 1);
+    app_mouse_up(a, tr.x + tr.w / 2 + 30, tr.y + 2, MOUSE_LEFT);
+    CHECK(a->view.fit, "a drag that starts on the transport does not pan");
+
+    /* The middle button drags the picture just like the left one, and it
+     * does not scrub when pressed on the timeline. */
+    app_key(a, KEY_FIT);
+    app_set_frame(a, 30);
+    before = view_rect(&a->view, vp, iw, ih);
+    app_mouse_down(a, px, py, APP_MOUSE_MIDDLE);
+    app_mouse_move(a, px - 25, py + 10, APP_HELD_MIDDLE);
+    after = view_rect(&a->view, vp, iw, ih);
+    CHECK(!a->view.fit, "a middle-button drag leaves fit mode");
+    CHECK(after.x == before.x - 25 && after.y == before.y + 10,
+          "the picture follows a middle-button drag (%d,%d -> %d,%d)", before.x, before.y, after.x, after.y);
+    app_mouse_move(a, px - 25, py + 10, APP_HELD_MIDDLE | APP_HELD_LEFT);
+    app_mouse_up(a, px - 25, py + 10, APP_MOUSE_LEFT);
+    app_mouse_move(a, px + 100, py + 10, APP_HELD_MIDDLE);
+    CHECK(view_rect(&a->view, vp, iw, ih).x == after.x + 125,
+          "releasing the left button does not end a middle-button pan");
+    app_mouse_up(a, px + 100, py + 10, APP_MOUSE_MIDDLE);
+    app_mouse_move(a, px + 300, py + 10, 0);
+    CHECK(view_rect(&a->view, vp, iw, ih).x == after.x + 125, "releasing the middle button ends the pan");
+    int ty = a->layout.track.y + a->layout.track.h / 2;
+    app_mouse_down(a, ui_x_for_frame(&a->layout, 60, a->seq->count), ty, APP_MOUSE_MIDDLE);
+    app_mouse_move(a, ui_x_for_frame(&a->layout, 70, a->seq->count), ty, APP_HELD_MIDDLE);
+    app_mouse_up(a, ui_x_for_frame(&a->layout, 70, a->seq->count), ty, APP_MOUSE_MIDDLE);
+    CHECK(a->current == 30, "the middle button does not scrub the timeline (frame %d)", a->current);
+    app_key(a, KEY_FIT);
 }
 
 static void test_memory_budget(const Sequence *seq, const ColorLUT *lut)
@@ -714,11 +984,13 @@ int main(int argc, char **argv)
     app_init(&app, seq, cache, 24.0);
     app_resize(&app, WIN_W, WIN_H);
 
+    test_view();
     test_timeline_mapping(&app);
     test_timeline_click_and_drag(&app);
     test_transport_buttons(&app);
     test_step_wrapping(&app);
     test_keyboard(&app);
+    test_viewport_mouse(&app);
 
     wait_for_cache(cache, seq->count, 30.0);
     test_playback_loops(&app);

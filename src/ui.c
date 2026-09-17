@@ -1,5 +1,6 @@
 #include "ui.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -24,6 +25,7 @@
 #define COL_BTN        RP_RGB(0x2a, 0x2e, 0x36)
 #define COL_WHITE      RP_RGB(0xff, 0xff, 0xff)
 #define COL_BLACK      RP_RGB(0x00, 0x00, 0x00)
+#define COL_GUIDE      RP_RGB(0xe6, 0xe9, 0xee)
 
 /* Base metrics, in unscaled pixels. */
 #define TRANSPORT_H 58
@@ -32,6 +34,10 @@
 #define BTN_GAP     5
 #define PAD         8
 #define RULER_H     15
+
+/* The frame guide, in source pixels. */
+#define GUIDE_W 1920
+#define GUIDE_H 1080
 
 static int S = 1; /* UI scale, for HiDPI displays */
 
@@ -364,11 +370,19 @@ static void draw_statusbar(Surface *s, App *a)
     rp_human_bytes(used, sizeof used, st.bytes_used);
     rp_human_bytes(limit, sizeof limit, st.bytes_limit);
 
+    /* The zoom, as a percentage, with FIT while the frame follows the window. */
+    char zoom[32];
+    {
+        double z = view_scale(&a->view, L->viewport, a->src_w, a->src_h) * 100.0;
+        snprintf(zoom, sizeof zoom, a->view.fit ? "FIT %.*f%%" : "%.*f%%",
+                 z < 10.0 ? 1 : 0, z);
+    }
+
     char right[256];
     if (a->src_w > 0)
         snprintf(right, sizeof right,
-                 "%dx%d   %d/%d   RAM %s / %s (%d frames)   %.4g fps%s",
-                 a->src_w, a->src_h, a->current + 1, a->seq->count,
+                 "%dx%d  %s   %d/%d   RAM %s / %s (%d frames)   %.4g fps%s",
+                 a->src_w, a->src_h, zoom, a->current + 1, a->seq->count,
                  used, limit, st.ready, a->fps,
                  st.failed ? "   ERRORS" : "");
     else
@@ -396,20 +410,37 @@ static void draw_badge(Surface *s, Rect area, const char *text, uint32_t bg, uin
     draw_text(s, r.x + pad, r.y + pad / 2, text, fg, S);
 }
 
+/* A 1920x1080 rectangle in source pixels, centred on the frame and drawn at
+ * the frame's own scale, so it marks the same footage however the view is
+ * zoomed or panned. */
+static void draw_guide(Surface *s, const App *a, Rect dst)
+{
+    int iw = a->shown->width, ih = a->shown->height;
+    double scale = view_scale(&a->view, a->layout.viewport, iw, ih);
+    double gw = GUIDE_W * scale, gh = GUIDE_H * scale;
+    double cx = dst.x + dst.w / 2.0, cy = dst.y + dst.h / 2.0;
+    Rect g = rect_make((int)lround(cx - gw / 2.0), (int)lround(cy - gh / 2.0),
+                       (int)lround(gw), (int)lround(gh));
+    draw_frame(s, a->layout.viewport, g, 2 * S, COL_GUIDE);
+}
+
 static void draw_help(Surface *s, const App *a)
 {
     static const char *const lines[] = {
-        "SPACE     play / pause forwards",
-        "B         play / pause backwards",
-        "LEFT      previous frame",
-        "RIGHT     next frame",
-        "PGUP/DOWN jump 10 frames",
-        "HOME/END  first / last frame",
-        "F         fit image to window",
-        "1         actual size (1:1)",
-        "S         toggle smooth scaling",
-        "?         this help",
-        "Q / ESC   quit",
+        "SPACE      play / pause, in the direction last played",
+        "J / K / L  play backwards / pause / play forwards",
+        "I / O      previous / next frame (SHIFT: 5 frames)",
+        "LEFT/RIGHT previous / next frame",
+        "PGUP/DOWN  jump 10 frames",
+        "HOME/END   first / last frame",
+        "WHEEL      zoom about the cursor",
+        "DRAG       pan the frame",
+        "BACKSPACE  fit image to window",
+        "0          actual size (1:1)",
+        "F          1920x1080 frame guide",
+        "S          toggle smooth scaling",
+        "?          this help",
+        "Q / ESC    quit",
         "",
         "Drag on the timeline to scrub.",
     };
@@ -436,9 +467,9 @@ void ui_draw(Surface *s, App *a)
 
     draw_rect(s, L->viewport, COL_VIEWPORT);
     if (a->shown) {
-        Rect dst = a->fit ? rect_fit(L->viewport, a->shown->width, a->shown->height)
-                          : rect_center(L->viewport, a->shown->width, a->shown->height);
+        Rect dst = view_rect(&a->view, L->viewport, a->shown->width, a->shown->height);
         draw_image(s, L->viewport, dst, a->shown, a->filter);
+        if (a->show_guide) draw_guide(s, a, dst);
     }
 
     int state = cache_frame_state(a->cache, a->current);
