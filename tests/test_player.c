@@ -953,6 +953,221 @@ static void test_abort_stale_decodes(const Sequence *seq, const ColorLUT *lut)
     cache_destroy(c);
 }
 
+/* ---- the reserve behind the playhead ------------------------------------ */
+
+/* Plays forwards frame by frame to `last` the way the player does. */
+static int play_to(Cache *c, int last)
+{
+    int reached = -1;
+    for (int f = 0; f <= last; f++) {
+        cache_set_focus(c, f, +1);
+        double t0 = rp_now();
+        while (cache_frame_state(c, f) != CACHE_READY && rp_now() - t0 < 10.0) rp_sleep_ms(5);
+        if (cache_frame_state(c, f) != CACHE_READY) break;
+        reached = f;
+    }
+    return reached == last;
+}
+
+/* With a reserve of 8 in a budget of 20, playing to frame 40 leaves 32..39
+ * behind the playhead and 40..51 ahead, and nothing else. Reversing then
+ * finds 32..39 there at once, while the frames that were ahead become the
+ * new reserve and the loaders fill below. */
+static void test_reserve_images(const Sequence *seq, const ColorLUT *lut)
+{
+    printf("reserve behind the playhead: image sequence\n");
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    Cache *c = cache_create(seq, lut, per_frame * 20, 4, per_frame);
+    CHECK(c != NULL, "cache creates with a budget of 20 frames");
+    if (!c) return;
+    cache_set_reserve(c, 8);
+
+    CHECK(play_to(c, 40), "played forwards to frame 40");
+    CHECK(wait_settled(c, 10.0), "loaders settle");
+    CHECK(all_ready(c, 32, 39), "the reserve 32..39 is resident");
+    CHECK(all_ready(c, 40, 51), "the window ahead 40..51 is resident");
+    CHECK(none_ready(c, 0, 31), "nothing older than the reserve is kept");
+    CHECK(none_ready(c, 52, seq->count - 1), "the read-ahead stops at the window");
+
+    cache_set_focus(c, 39, -1);
+    CHECK(all_ready(c, 32, 39), "reversing finds the reserve resident at once");
+    int misses = 0;
+    for (int f = 39; f >= 32; f--) {
+        cache_set_focus(c, f, -1);
+        if (cache_frame_state(c, f) != CACHE_READY) misses++;
+    }
+    CHECK(misses == 0, "playing back through the reserve never waits (%d misses)", misses);
+    /* At frame 32 going backwards the window is 32..21 and the reserve 33..40. */
+    CHECK(wait_all_ready(c, 21, 31, 10.0), "the loaders fill below the reversal (21..31)");
+    CHECK(wait_settled(c, 10.0), "and settle");
+    CHECK(all_ready(c, 33, 40), "the frames just played are now the reserve (33..40)");
+
+    cache_destroy(c);
+}
+
+/* ---- video ------------------------------------------------------------- */
+
+static Sequence *open_video(const char *path)
+{
+    char err[256];
+    char *one[1] = { (char *)path };
+    Sequence *s = sequence_open(one, 1, err, sizeof err);
+    if (!s) printf("  cannot open %s: %s\n", path, err);
+    return s;
+}
+
+/* Frame i of the fixtures is a flat colour encoding i; see
+ * tools/make_test_video.sh. */
+static int video_frame_is(const Image *im, int i)
+{
+    int r = (i * 53) & 255, g = (i * 97) & 255, b = (i * 29) & 255;
+    uint32_t p = im->px[(size_t)(im->height / 2) * im->width + im->width / 2];
+    int pr = (p >> 16) & 255, pg = (p >> 8) & 255, pb = p & 255;
+    int ok = abs(pr - r) <= 12 && abs(pg - g) <= 12 && abs(pb - b) <= 12;
+    if (!ok) printf("  frame %d: got R%d G%d B%d, wanted R%d G%d B%d\n", i, pr, pg, pb, r, g, b);
+    return ok;
+}
+
+static int resident_frame_is(Cache *c, int f)
+{
+    Image *im = cache_acquire(c, f);
+    int ok = im && video_frame_is(im, f);
+    image_unref(im);
+    return ok;
+}
+
+/* Two loaders, a budget of 30 frames, groups of 24. Filling from frame 0
+ * must decode exactly the 30 frames that fit, once each: one loader takes
+ * group 0, the other group 1 and stops when the budget is full. A scrub to
+ * frame 50 seeks to its group and lands it, then the rest of the group. */
+static void test_video_groups(const ColorLUT *lut)
+{
+    printf("video: groups fill without waste, scrubbing seeks\n");
+    Sequence *seq = open_video("test/video/h264_gop24.mp4");
+    if (!seq) { CHECK(0, "the video fixture opens"); return; }
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    Cache *c = cache_create(seq, lut, per_frame * 30, 2, per_frame);
+    CHECK(c != NULL, "a video cache creates");
+    if (!c) { sequence_free(seq); return; }
+
+    cache_set_focus(c, 0, +1);
+    CHECK(wait_all_ready(c, 0, 29, 20.0), "frames 0..29 fill the budget");
+    CHECK(wait_settled(c, 10.0), "loaders settle");
+
+    CacheStats st;
+    cache_get_stats(c, &st);
+    CHECK(st.ready == 30, "exactly the budget is resident (%d)", st.ready);
+    CHECK(st.bytes_used <= per_frame * 30, "the budget holds");
+    CHECK(st.discarded == 0, "no decoded frame was thrown away (%d)", st.discarded);
+    CHECK(st.delivered == 30, "no frame was decoded twice (%d delivered for 30 resident)", st.delivered);
+    CHECK(st.failed == 0 && cache_last_error(c) == NULL, "nothing failed");
+    CHECK(resident_frame_is(c, 17) && resident_frame_is(c, 29), "resident frames are the right pictures");
+
+    cache_set_focus(c, 50, +1);
+    CHECK(wait_all_ready(c, 50, 50, 10.0), "a scrub to frame 50 lands it");
+    CHECK(resident_frame_is(c, 50), "and it is the right picture");
+    CHECK(wait_all_ready(c, 48, 71, 10.0), "the rest of its group follows (48..71)");
+    cache_get_stats(c, &st);
+    CHECK(st.failed == 0, "still nothing failed");
+
+    cache_destroy(c);
+
+    /* The scrub stress case, on video. */
+    test_scrub_stress(seq, lut);
+    sequence_free(seq);
+}
+
+/* One loader on the one-group file with a budget of 16: a jump far away
+ * while the group decodes cancels it, leaves nothing failed, and the frame
+ * the playhead comes back to loads again. The decode towards frame 60 runs
+ * on from wherever the loader stopped, so the jump back waits until it is
+ * well past the playhead's reach before pulling the playhead away. */
+static void test_video_abort(const ColorLUT *lut)
+{
+    printf("video: a jump out of reach cancels the group\n");
+    Sequence *seq = open_video("test/video/h264_onegop.mp4");
+    if (!seq) { CHECK(0, "the one-group fixture opens"); return; }
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    Cache *c = cache_create(seq, lut, per_frame * 16, 1, per_frame);
+    CHECK(c != NULL, "a one-loader video cache creates");
+    if (!c) { sequence_free(seq); return; }
+
+    /* Budget 16, so the reserve is 8 and the window 8: 2..9 behind, 10..17
+     * ahead. */
+    cache_set_focus(c, 10, +1);
+    CHECK(wait_all_ready(c, 2, 17, 20.0), "the budget fills around the playhead (2..17)");
+    wait_settled(c, 10.0);
+
+    CacheStats st;
+    int tries;
+    for (tries = 0; tries < 20; tries++) {
+        cache_set_focus(c, 60, +1);
+        double t0 = rp_now();
+        while (cache_frame_state(c, 45) != CACHE_READY && rp_now() - t0 < 0.5) { /* spin */ }
+        cache_set_focus(c, 10, +1);
+        wait_settled(c, 10.0);
+        cache_get_stats(c, &st);
+        if (st.aborted > 0) break;
+    }
+    CHECK(st.aborted > 0, "a jump away cancelled a group decode in progress (%d tries)", tries + 1);
+    CHECK(st.failed == 0, "a cancelled decode is not a failure (%d failed)", st.failed);
+    CHECK(cache_last_error(c) == NULL, "a cancelled decode reports no error");
+    CHECK(wait_all_ready(c, 10, 10, 10.0), "the frame the playhead returns to loads");
+    CHECK(resident_frame_is(c, 10), "and is the right picture");
+
+    cache_destroy(c);
+    sequence_free(seq);
+}
+
+/* The video reserve follows the groups. With a budget of 30 and groups of
+ * 24, playing to frame 40 keeps the shown part of its group plus the group
+ * before, capped at half the budget: 25..39, with 40..54 ahead. Reversing
+ * plays 39 down to 25 from RAM while the group below refills. */
+static void test_video_reserve(const ColorLUT *lut)
+{
+    printf("video: a group's worth stays behind the playhead\n");
+    Sequence *seq = open_video("test/video/h264_gop24.mp4");
+    if (!seq) { CHECK(0, "the video fixture opens"); return; }
+
+    size_t per_frame = (size_t)seq->width * seq->height * 4;
+    Cache *c = cache_create(seq, lut, per_frame * 30, 2, per_frame);
+    CHECK(c != NULL, "a video cache creates");
+    if (!c) { sequence_free(seq); return; }
+
+    CHECK(play_to(c, 40), "played forwards to frame 40");
+    CHECK(wait_settled(c, 10.0), "loaders settle");
+    CHECK(all_ready(c, 25, 39), "the reserve 25..39 is resident");
+    CHECK(all_ready(c, 40, 54), "the window ahead 40..54 is resident");
+    CHECK(none_ready(c, 0, 24), "nothing older than the reserve is kept");
+    CHECK(none_ready(c, 55, 95), "the read-ahead stops at the window");
+
+    /* Forward playback is one linear decode: 55 frames were needed, and a
+     * pick always goes to the reader already positioned for it, so nothing
+     * was decoded again from a keyframe. */
+    CacheStats st;
+    cache_get_stats(c, &st);
+    CHECK(st.decoded <= 55 + 4, "playing to 40 decoded each frame once (%d pictures for 55 frames)", st.decoded);
+    CHECK(st.discarded == 0, "and threw none away (%d)", st.discarded);
+
+    cache_set_focus(c, 39, -1);
+    int misses = 0;
+    for (int f = 39; f >= 25; f--) {
+        cache_set_focus(c, f, -1);
+        if (cache_frame_state(c, f) != CACHE_READY) misses++;
+    }
+    CHECK(misses == 0, "playing back through the reserve never waits (%d misses)", misses);
+    CHECK(wait_all_ready(c, 11, 24, 20.0), "the group below refills behind the reversal (11..24)");
+    CHECK(wait_settled(c, 10.0), "and settles");
+    CHECK(all_ready(c, 26, 40), "the frames just played are now the reserve (26..40)");
+    CHECK(resident_frame_is(c, 12) && resident_frame_is(c, 30), "resident frames are the right pictures");
+
+    cache_destroy(c);
+    sequence_free(seq);
+}
+
 /* ---- main --------------------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -1006,8 +1221,14 @@ int main(int argc, char **argv)
     test_nearest_resident_stand_in(seq, &lut);
     test_abort_stale_decodes(seq, &lut);
     test_scrub_stress(seq, &lut);
+    test_reserve_images(seq, &lut);
 
     sequence_free(seq);
+
+    reader_set_decoder_threads(2);
+    test_video_groups(&lut);
+    test_video_abort(&lut);
+    test_video_reserve(&lut);
 
     printf("\n%d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

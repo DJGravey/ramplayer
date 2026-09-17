@@ -216,11 +216,12 @@ static void usage(FILE *out)
     fprintf(out,
         "ramplayer - load image sequences into RAM and scrub through them\n"
         "\n"
-        "usage: ramplayer [options] <frame|pattern|directory> [more frames...]\n"
+        "usage: ramplayer [options] <frame|pattern|directory|video> [more frames...]\n"
         "\n"
         "  A single frame of a sequence expands to the whole sequence, so\n"
         "  'ramplayer shot.0042.exr' plays every shot.####.exr beside it.\n"
-        "  Patterns (shot.%%04d.exr, shot.####.exr) and directories work too.\n"
+        "  Patterns (shot.%%04d.exr, shot.####.exr) and directories work too,\n"
+        "  as does an H.264 or H.265 video in an .mp4, .m4v or .mov file.\n"
         "\n"
         "options:\n"
         "  --mem SIZE      RAM budget for cached frames (default 1G)\n"
@@ -375,9 +376,10 @@ int main(int argc, char **argv)
     }
 
     /* Probe a few frames rather than only the first: one damaged frame at the
-     * head of a render should not stop the rest of it from playing. */
-    double file_fps = 0.0;
-    {
+     * head of a render should not stop the rest of it from playing. A video
+     * already knows its size and rate from the container. */
+    double file_fps = seq->fps;
+    if (seq->kind == SEQ_IMAGES) {
         int probe_idx[4] = { 0, seq->count / 2, seq->count - 1, seq->count / 4 };
         int ok = 0;
         for (int i = 0; i < RP_ARRAY_LEN(probe_idx) && !ok; i++) {
@@ -456,7 +458,15 @@ int main(int argc, char **argv)
         ui_set_scale((ww > 0 && ow >= ww * 3 / 2) ? 2 : 1);
     }
 
-    int threads = opt.threads > 0 ? opt.threads : default_thread_count();
+    /* Image loaders are independent, so one per core. A video decoder holds
+     * reference pictures and runs threads of its own, so two loaders share
+     * the cores between them. */
+    int threads;
+    if (opt.threads > 0)               threads = opt.threads;
+    else if (seq->kind == SEQ_VIDEO)   threads = 2;
+    else                               threads = default_thread_count();
+    if (seq->kind == SEQ_VIDEO)
+        reader_set_decoder_threads(RP_MAX(1, (SDL_GetCPUCount() - 1) / threads));
     reader_set_readers(opt.readers);
     Cache *cache = cache_create(seq, &lut, opt.mem_limit, threads,
                                 (size_t)seq->width * seq->height * 4);
@@ -469,6 +479,9 @@ int main(int argc, char **argv)
         return 1;
     }
     cache_set_wakeup(cache, wake_main_thread, NULL);
+    /* About a second of frames stays behind the playhead so a reversal plays
+     * from RAM; a video derives the same thing from its groups. */
+    if (seq->kind == SEQ_IMAGES) cache_set_reserve(cache, (int)(opt.fps + 0.5));
 
     App app;
     app_init(&app, seq, cache, opt.fps);

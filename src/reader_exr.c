@@ -8,7 +8,7 @@
  * converted into the destination image immediately, so peak memory per loader
  * thread stays in the tens of kilobytes rather than a full float image.
  */
-#include "reader.h"
+#include "reader_internal.h"
 
 #include <openexr.h>
 #include <stdio.h>
@@ -583,4 +583,63 @@ done:
     if (started) exr_decoding_destroy(ctxt, &decode);
     exr_finish(&ctxt);
     return NULL;
+}
+
+/* ---- the Reader over EXR sequences ---------------------------------------
+ * Every frame is its own file, so a range is loaded one frame at a time and
+ * each delivered as it lands. A frame that fails is reported through the
+ * callback and the range goes on; only a cancel ends it. */
+
+typedef struct {
+    Reader          base;
+    const Sequence *seq;
+    const ColorLUT *lut;
+    DecodeScratch  *scratch;
+} ExrReader;
+
+static int exr_load_range(Reader *r, int from, int to, ReaderDeliver deliver, ReaderWanted wanted,
+                          void *ud, const atomic_int *abort_flag, char *err, size_t errsz)
+{
+    ExrReader *er = (ExrReader *)r;
+    char ferr[256];
+
+    for (int f = from; f < to; f++) {
+        if (wanted && !wanted(ud, f)) continue; /* every frame is its own file */
+        ferr[0] = '\0';
+        Image *im = reader_load(er->seq->frames[f].path, er->lut, er->scratch, abort_flag,
+                                ferr, sizeof ferr);
+        if (!im && strcmp(ferr, READER_ERR_CANCELLED) == 0) {
+            snprintf(err, errsz, "%s", READER_ERR_CANCELLED);
+            return 0;
+        }
+        if (!deliver(ud, f, im, im ? NULL : ferr)) break;
+    }
+    return 1;
+}
+
+/* Any frame is as cheap as any other: no position to prefer. */
+static int exr_position(const Reader *r)
+{
+    (void)r;
+    return -1;
+}
+
+static void exr_close(Reader *r)
+{
+    ExrReader *er = (ExrReader *)r;
+    decode_scratch_destroy(er->scratch);
+    free(er);
+}
+
+static const ReaderOps exr_ops = { exr_load_range, exr_position, exr_close };
+
+Reader *reader_exr_open(const Sequence *seq, const ColorLUT *lut, char *err, size_t errsz)
+{
+    (void)err; (void)errsz;
+    ExrReader *er = rp_xcalloc(1, sizeof *er);
+    er->base.ops = &exr_ops;
+    er->seq      = seq;
+    er->lut      = lut;
+    er->scratch  = decode_scratch_create();
+    return &er->base;
 }

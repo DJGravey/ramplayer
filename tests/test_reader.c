@@ -6,6 +6,7 @@
  * so a decoder that mislays the data window offset fails a position check
  * rather than merely looking wrong.
  */
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -376,10 +377,326 @@ static void test_scratch_reuse(void)
     image_unref(small);
 }
 
+/* ---- the Reader interface ------------------------------------------------ */
+
+/* Collects what a range delivers: the frame numbers in order, whether every
+ * frame decoded and carried the pattern expected of it, and optionally the
+ * first image, kept for inspection. Can raise a soft cancel after a number
+ * of frames. */
+typedef struct {
+    int        got[128];
+    int        n;
+    int        all_ok;
+    Image     *first;
+    int        stop_after; /* raise the cancel once this many arrived; 0 never */
+    atomic_int abort;
+    int      (*check)(const Image *, int frame);
+} Collected;
+
+static void collected_init(Collected *d, int (*check)(const Image *, int))
+{
+    memset(d, 0, sizeof *d);
+    d->all_ok = 1;
+    d->check  = check;
+    atomic_init(&d->abort, 0);
+}
+
+static int collect(void *ud, int frame, Image *im, const char *err)
+{
+    Collected *d = ud;
+    if (d->n < (int)(sizeof d->got / sizeof *d->got)) d->got[d->n] = frame;
+    d->n++;
+    if (!im) {
+        printf("  frame %d failed: %s\n", frame, err ? err : "?");
+        d->all_ok = 0;
+    } else if (d->check && !d->check(im, frame)) {
+        d->all_ok = 0;
+    }
+    if (im && !d->first) d->first = im;
+    else image_unref(im);
+    if (d->stop_after && d->n >= d->stop_after)
+        atomic_store(&d->abort, READER_CANCEL_SOFT);
+    return 1;
+}
+
+/* Did the range deliver exactly from..to-1, in order? */
+static int got_exactly(const Collected *d, int from, int to)
+{
+    if (d->n != to - from) return 0;
+    for (int i = 0; i < d->n; i++)
+        if (d->got[i] != from + i) return 0;
+    return 1;
+}
+
+static Sequence *open_one(const char *path)
+{
+    char err[256];
+    char *one[1] = { (char *)path };
+    Sequence *s = sequence_open(one, 1, err, sizeof err);
+    if (!s) printf("  cannot open %s: %s\n", path, err);
+    return s;
+}
+
+/* The EXR backend behind the Reader interface must give exactly what the
+ * path-based loader gives. */
+static void test_reader_interface_exr(void)
+{
+    printf("the Reader interface over EXR files\n");
+    char err[256];
+
+    Sequence *seq = open_one("test/seq_a/beauty.1001.exr");
+    CHECK(seq != NULL, "the EXR sequence opens");
+    if (!seq) return;
+
+    Reader *r = reader_open(seq, &g_lut, err, sizeof err);
+    CHECK(r != NULL, "an EXR reader opens: %s", err);
+    if (r) {
+        Collected d;
+        collected_init(&d, NULL);
+        CHECK(reader_load_range(r, 5, 6, collect, NULL, &d, NULL, err, sizeof err), "a one-frame range loads: %s", err);
+        CHECK(got_exactly(&d, 5, 6), "and delivers exactly frame 5 (got %d frames)", d.n);
+        Image *direct = load(seq->frames[5].path, err, sizeof err);
+        CHECK(d.first && direct && d.first->bytes == direct->bytes &&
+              memcmp(d.first->px, direct->px, direct->bytes) == 0,
+              "the delivered frame is pixel for pixel the path-based decode");
+        image_unref(direct);
+        image_unref(d.first);
+
+        /* A range spanning several frames delivers each in order. */
+        collected_init(&d, NULL);
+        CHECK(reader_load_range(r, 10, 13, collect, NULL, &d, NULL, err, sizeof err), "a three-frame range loads");
+        CHECK(got_exactly(&d, 10, 13), "and delivers 10, 11, 12 in order");
+        image_unref(d.first);
+
+        /* A cancel raised before the load ends the range as cancelled. */
+        collected_init(&d, NULL);
+        atomic_store(&d.abort, READER_CANCEL_HARD);
+        err[0] = '\0';
+        CHECK(!reader_load_range(r, 20, 21, collect, NULL, &d, &d.abort, err, sizeof err) &&
+              strcmp(err, READER_ERR_CANCELLED) == 0,
+              "a cancelled range reports the cancel (got '%s')", err);
+        CHECK(d.n == 0, "and delivers nothing");
+        reader_close(r);
+    }
+    sequence_free(seq);
+}
+
+/* ---- video ---------------------------------------------------------------- */
+
+static const char *const VIDEOS[] = {
+    "test/video/h264_gop24.mp4",
+    "test/video/h265_gop24_10bit.mp4",
+    "test/video/h264_onegop.mp4",
+    "test/video/h264_opengop.mp4",
+};
+
+/* Frame i of every fixture is a flat colour that encodes i (see
+ * tools/make_test_video.sh). Lossy coding of a flat frame is close, so the
+ * tolerance is generous but far below the step between neighbours. */
+static int video_frame_is(const Image *im, int i)
+{
+    int r = (i * 53) & 255, g = (i * 97) & 255, b = (i * 29) & 255;
+    int x = im->width / 2, y = im->height / 2;
+    int ok = abs(px_r(im, x, y) - r) <= 12 && abs(px_g(im, x, y) - g) <= 12 &&
+             abs(px_b(im, x, y) - b) <= 12;
+    if (!ok)
+        printf("  frame %d: got R%d G%d B%d, wanted R%d G%d B%d\n", i,
+               px_r(im, x, y), px_g(im, x, y), px_b(im, x, y), r, g, b);
+    return ok;
+}
+
+static void test_video_index(void)
+{
+    printf("video: the container index\n");
+    char err[256];
+
+    for (int v = 0; v < (int)(sizeof VIDEOS / sizeof *VIDEOS); v++) {
+        const char *path = VIDEOS[v];
+        VideoIndex vi;
+        int ok = reader_video_index(path, &vi, err, sizeof err);
+        CHECK(ok, "%s indexes: %s", path, err);
+        if (!ok) continue;
+        CHECK(vi.count == 96, "%s has 96 frames (got %d)", path, vi.count);
+        CHECK(vi.width == 320 && vi.height == 180, "%s is 320x180 (got %dx%d)", path, vi.width, vi.height);
+        CHECK(vi.fps > 23.9 && vi.fps < 24.1, "%s runs at 24 fps (got %g)", path, vi.fps);
+        /* The index is in decode order. In a closed group the keyframe is
+         * first in both orders; in an open group up to three leading frames
+         * display before it, so its entry sits that much earlier. The reader
+         * maps pictures by timestamp, so this only shifts where a group is
+         * said to start. */
+        int onegop  = strstr(path, "onegop") != NULL;
+        int opengop = strstr(path, "opengop") != NULL;
+        int keys[8], n_keys = 0;
+        if (vi.count == 96) {
+            CHECK(vi.keyframe[0], "%s: frame 0 is a keyframe", path);
+            for (int i = 0; i < 96; i++)
+                if (vi.keyframe[i] && n_keys < 8) keys[n_keys++] = i;
+            if (onegop) {
+                CHECK(n_keys == 1, "%s: no keyframe after the first (%d)", path, n_keys);
+            } else {
+                int placed = n_keys == 4;
+                for (int k = 1; k < n_keys && k < 4; k++) {
+                    int lo = opengop ? 24 * k - 3 : 24 * k;
+                    if (keys[k] < lo || keys[k] > 24 * k) placed = 0;
+                }
+                CHECK(placed, "%s: four keyframes, at 24, 48, 72%s (got %d at %d, %d, %d)", path,
+                      opengop ? " or up to three earlier" : "", n_keys,
+                      n_keys > 1 ? keys[1] : -1, n_keys > 2 ? keys[2] : -1, n_keys > 3 ? keys[3] : -1);
+            }
+        }
+        free(vi.keyframe);
+
+        Sequence *s = open_one(path);
+        CHECK(s != NULL, "%s opens as a sequence", path);
+        if (s) {
+            CHECK(s->kind == SEQ_VIDEO, "%s is a video sequence", path);
+            CHECK(s->count == 96 && s->fps > 23.9 && s->width == 320, "%s carries count, rate and size", path);
+            CHECK(s->frames[5].number == 5 && s->frames[5].path == NULL, "%s frames are numbered from 0 with no path", path);
+            CHECK(strcmp(s->display, path + strlen("test/video/")) == 0, "%s display name is the file name (got '%s')", path, s->display);
+            if (onegop) {
+                CHECK(sequence_group_start(s, 95) == 0 && sequence_group_end(s, 0) == 96,
+                      "%s: one group covering everything", path);
+            } else if (n_keys == 4) {
+                CHECK(sequence_group_start(s, 30) == keys[1] && sequence_group_end(s, 30) == keys[2],
+                      "%s: frame 30 is in group %d..%d (got %d..%d)", path, keys[1], keys[2] - 1,
+                      sequence_group_start(s, 30), sequence_group_end(s, 30));
+                CHECK(sequence_group_start(s, 95) == keys[3] && sequence_group_end(s, keys[3]) == 96,
+                      "%s: the last group is %d..95", path, keys[3]);
+            }
+            sequence_free(s);
+        }
+    }
+
+    /* Bad inputs fail with a message. */
+    VideoIndex vi;
+    err[0] = '\0';
+    CHECK(!reader_video_index("test/video/does_not_exist.mp4", &vi, err, sizeof err) && err[0],
+          "a missing video reports an error");
+    err[0] = '\0';
+    CHECK(!reader_video_index("test/edge/plain.exr", &vi, err, sizeof err) && err[0],
+          "a file that is not a video reports an error (got '%s')", err);
+    err[0] = '\0';
+    char *one[1] = { (char *)"test/video" };
+    Sequence *s = sequence_open(one, 1, err, sizeof err);
+    CHECK(s == NULL, "a directory of videos is not opened as a video");
+    sequence_free(s);
+}
+
+static void test_video_decode(void)
+{
+    printf("video: decoding, seeking and continuing\n");
+    char err[256];
+
+    for (int v = 0; v < (int)(sizeof VIDEOS / sizeof *VIDEOS); v++) {
+        const char *path = VIDEOS[v];
+        Sequence *seq = open_one(path);
+        if (!seq) { CHECK(0, "%s opens", path); continue; }
+
+        /* The whole file, start to end, every frame the right one. */
+        Reader *r = reader_open(seq, &g_lut, err, sizeof err);
+        CHECK(r != NULL, "%s: a reader opens: %s", path, err);
+        if (r) {
+            Collected d;
+            collected_init(&d, video_frame_is);
+            CHECK(reader_load_range(r, 0, 96, collect, NULL, &d, NULL, err, sizeof err), "%s: 0..95 loads: %s", path, err);
+            CHECK(got_exactly(&d, 0, 96), "%s: delivers all 96 frames in order (got %d)", path, d.n);
+            CHECK(d.all_ok, "%s: every frame carries its own colour", path);
+            CHECK(d.first && d.first->width == 320 && d.first->height == 180, "%s: frames are 320x180", path);
+            image_unref(d.first);
+            reader_close(r);
+        }
+
+        /* Ranges that follow on continue without a seek; a jump seeks. */
+        r = reader_open(seq, &g_lut, err, sizeof err);
+        if (r) {
+            int seeks = 0;
+            Collected d;
+            collected_init(&d, video_frame_is);
+            reader_load_range(r, 0, 10, collect, NULL, &d, NULL, err, sizeof err);
+            CHECK(got_exactly(&d, 0, 10) && d.all_ok, "%s: 0..9 loads", path);
+            reader_video_stats(r, &seeks, NULL);
+            CHECK(seeks == 1, "%s: the first range seeks once (got %d)", path, seeks);
+            image_unref(d.first);
+
+            collected_init(&d, video_frame_is);
+            reader_load_range(r, 10, 20, collect, NULL, &d, NULL, err, sizeof err);
+            CHECK(got_exactly(&d, 10, 20) && d.all_ok, "%s: 10..19 follows on", path);
+            reader_video_stats(r, &seeks, NULL);
+            CHECK(seeks == 1, "%s: and does so without a seek (got %d)", path, seeks);
+            image_unref(d.first);
+
+            /* A jump forwards seeks to the group, unless there is no keyframe
+             * between here and there, when decoding on is the cheaper way. */
+            collected_init(&d, video_frame_is);
+            reader_load_range(r, 50, 60, collect, NULL, &d, NULL, err, sizeof err);
+            CHECK(got_exactly(&d, 50, 60) && d.all_ok, "%s: 50..59 after a jump delivers exactly those (got %d)", path, d.n);
+            reader_video_stats(r, &seeks, NULL);
+            int onegop = strstr(path, "onegop") != NULL;
+            if (onegop) CHECK(seeks == 1, "%s: the jump decodes on rather than seeking to frame 0 (got %d)", path, seeks);
+            else        CHECK(seeks >= 2, "%s: the jump seeks (got %d)", path, seeks);
+            image_unref(d.first);
+
+            collected_init(&d, video_frame_is);
+            reader_load_range(r, 30, 35, collect, NULL, &d, NULL, err, sizeof err);
+            CHECK(got_exactly(&d, 30, 35) && d.all_ok, "%s: a jump backwards to 30..34 delivers exactly those", path);
+            image_unref(d.first);
+
+            /* Every group's first frames, straight from a seek: the place
+             * where an open group's decode-order keyframe misleads. */
+            int starts_ok = 1;
+            for (int gs = 0; gs < 96; gs += 24) {
+                collected_init(&d, video_frame_is);
+                reader_load_range(r, gs, gs + 3, collect, NULL, &d, NULL, err, sizeof err);
+                if (!got_exactly(&d, gs, gs + 3) || !d.all_ok) starts_ok = 0;
+                image_unref(d.first);
+                collected_init(&d, video_frame_is);
+                reader_load_range(r, gs + 20, gs + 22, collect, NULL, &d, NULL, err, sizeof err);
+                if (!got_exactly(&d, gs + 20, gs + 22) || !d.all_ok) starts_ok = 0;
+                image_unref(d.first);
+            }
+            CHECK(starts_ok, "%s: the frames after every seek are the right ones", path);
+            reader_close(r);
+        }
+        sequence_free(seq);
+    }
+
+    /* A soft cancel stops a range at the next frame, keeps what was
+     * delivered, and leaves the reader able to continue where it stopped. */
+    Sequence *seq = open_one("test/video/h264_onegop.mp4");
+    Reader *r = seq ? reader_open(seq, &g_lut, err, sizeof err) : NULL;
+    CHECK(r != NULL, "the one-group file opens for the cancel case");
+    if (r) {
+        Collected d;
+        collected_init(&d, video_frame_is);
+        d.stop_after = 5;
+        err[0] = '\0';
+        int ok = reader_load_range(r, 0, 96, collect, NULL, &d, &d.abort, err, sizeof err);
+        CHECK(!ok && strcmp(err, READER_ERR_CANCELLED) == 0, "a soft cancel ends the range as cancelled (got '%s')", err);
+        CHECK(d.n >= 5 && d.n < 96, "the cancel took effect within a few frames (%d delivered)", d.n);
+        CHECK(d.all_ok, "the frames delivered before the cancel are right");
+        image_unref(d.first);
+
+        int seeks_before = 0;
+        reader_video_stats(r, &seeks_before, NULL);
+        int resume = d.n;
+        collected_init(&d, video_frame_is);
+        CHECK(reader_load_range(r, resume, resume + 5, collect, NULL, &d, NULL, err, sizeof err),
+              "the range after a cancel loads");
+        int seeks_after = 0;
+        reader_video_stats(r, &seeks_after, NULL);
+        CHECK(got_exactly(&d, resume, resume + 5) && d.all_ok && seeks_after == seeks_before,
+              "and continues from where the cancel stopped, without a seek");
+        image_unref(d.first);
+        reader_close(r);
+    }
+    sequence_free(seq);
+}
+
 int main(void)
 {
     color_lut_init(&g_lut);
     g_scratch = decode_scratch_create();
+    reader_set_decoder_threads(2);
 
     /* Every decode case runs with the decoder reading the file itself (0),
      * and in whole-file mode with one and with two permits. */
@@ -397,6 +714,10 @@ int main(void)
     reader_set_readers(1);
     test_scratch_reuse();
     reader_set_readers(0);
+
+    test_reader_interface_exr();
+    test_video_index();
+    test_video_decode();
 
     decode_scratch_destroy(g_scratch);
     printf("\n%d passed, %d failed\n", g_pass, g_fail);

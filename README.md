@@ -1,8 +1,8 @@
 # ramplayer
 
-A RAM player for image sequences: it loads frames into memory up to a fixed
-budget and lets you scrub through them at speed. EXR sequences are the current
-focus; video is the next step.
+A RAM player for image sequences and video: it loads frames into memory up to
+a fixed budget and lets you scrub through them at speed. EXR sequences and
+H.264 or H.265 video in MP4 are what it plays today.
 
 Written in C11. All drawing is done on the CPU into a system-memory buffer —
 there is no GPU code. SDL2 is used only to own a window and hand that one
@@ -10,8 +10,11 @@ finished buffer to the display.
 
 ## Building
 
-Needs a C compiler, CMake, SDL2 and OpenEXR 3.x (we use its pure-C
-`OpenEXRCore` API, so no C++ is involved).
+Needs a C compiler, CMake, SDL2, OpenEXR 3.x (we use its pure-C
+`OpenEXRCore` API, so no C++ is involved) and FFmpeg's libavformat,
+libavcodec, libavutil and libswscale for video. H.264 and H.265 decoding
+are native to libavcodec, so no x264 or x265 is needed and an LGPL build of
+FFmpeg is enough; it is linked dynamically.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -21,9 +24,10 @@ cmake --build build -j
 ### Windows
 
 Builds with Visual Studio 2022 or later (MSVC 19.35+ for C11 atomics) and
-vcpkg, which fetches SDL2 and OpenEXR from the manifest. From a Developer
-PowerShell with `VCPKG_ROOT` set (Visual Studio's bundled copy lives at
-`<VS>\VC\vcpkg`):
+vcpkg, which fetches SDL2, OpenEXR and FFmpeg from the manifest. The first
+configure builds FFmpeg from source and takes a while; later ones use vcpkg's
+binary cache. From a Developer PowerShell with `VCPKG_ROOT` set (Visual
+Studio's bundled copy lives at `<VS>\VC\vcpkg`):
 
 ```powershell
 cmake --preset windows
@@ -45,6 +49,7 @@ ramplayer 'shot.%04d.exr'      # printf pattern
 ramplayer 'shot.####.exr'      # hash pattern
 ramplayer /renders/shot/       # the largest sequence in a directory
 ramplayer a.exr b.exr c.exr    # an explicit list, ordered by frame number
+ramplayer shot.mp4             # an H.264 or H.265 video (.mp4, .m4v, .mov)
 ```
 
 Options:
@@ -52,9 +57,9 @@ Options:
 | Option | Meaning |
 | --- | --- |
 | `--mem SIZE` | RAM budget for cached frames; default `1G`. Accepts `512M`, `4G`, … A budget too small for two frames is raised to that, since playback could not otherwise advance. |
-| `--fps RATE` | Playback rate. Defaults to the sequence's own `framesPerSecond`, else 30. |
-| `--threads N` | Loader threads; default is one per core, less one. |
-| `--readers N` | Read each frame file whole, at most `N` files at a time, and decode from memory. By default the decoder reads the file itself, chunk by chunk, with every loader thread independent. See Spinning disks below. |
+| `--fps RATE` | Playback rate. Defaults to the sequence's own `framesPerSecond`, or the video's frame rate, else 30. |
+| `--threads N` | Loader threads; default is one per core, less one, for image sequences and 2 for video, each video loader running its own decoder threads on the remaining cores. |
+| `--readers N` | Read each frame file whole, at most `N` files at a time, and decode from memory. By default the decoder reads the file itself, chunk by chunk, with every loader thread independent. See Spinning disks below. Not applied to video. |
 | `--scale N` | UI scale factor for HiDPI displays. |
 
 Controls:
@@ -136,6 +141,14 @@ scrubbing back over what was just played, therefore finds those frames still
 in RAM while the loaders turn around, and the space for the new direction
 comes from the far end of the old one.
 
+On top of that ordering a reserve of frames behind the playhead, against the
+direction of play, is kept in preference to frames far ahead: about a second
+of frames for an image sequence, and for a video the frames of the current
+group already shown plus the whole group before it, in each case at most half
+the budget. The read-ahead fills forwards only up to the budget less the
+reserve and never evicts it, so a reversal plays from RAM for at least that
+long while the loaders decode the next group the other way.
+
 A frame is only fetched if there is room for it, or if something resident is
 worth less than it, beyond what the loads already in flight will take when
 they land. That admission rule is what keeps a full cache from thrashing and
@@ -172,6 +185,34 @@ Scanline and tiled files are both handled, along with mipmapped files (level 0),
 data windows that differ from the display window, and single-channel luminance
 images.
 
+**Video** (`src/reader_video.c`) goes through FFmpeg: libavformat demuxes,
+libavcodec decodes, libswscale converts each picture into the same
+display-ready BGRA image an EXR frame becomes, in the stream's own colour
+matrix and range (BT.709 or BT.601, limited or full; 8-bit and 10-bit 4:2:0).
+Video is display-referred already, so the linear-to-sRGB table is not
+applied. Frames are numbered in display order at a constant rate; the count,
+the rate and the keyframes come from the container's index without reading
+any frame data.
+
+A video frame cannot be decoded on its own: it needs everything from the
+keyframe before it, so frames come in groups, one keyframe to the next.
+Rather than have several threads seek to the same keyframe and decode the
+same frames, one loader claims a whole group, decodes it in order and hands
+each frame to the cache as it lands, so the frame under the playhead shows
+the moment it is reached. A loader stops when the rest of the group would not
+fit and keeps its decoder where it is, so the playhead arriving later carries
+on without a seek; a pick goes to the loader whose decoder is nearest to it,
+so forward playback is one linear decode however many loaders there are. A group longer than
+the budget is decoded as far as fits; playing backwards through such a group
+is the one thing this design cannot do well, since a group is decoded
+forwards. Scrubbing lands within a seek plus up to one group of decoding,
+and the nearest resident frame stands in meanwhile as it does for images.
+
+Each video loader holds a decoder with its reference pictures and runs
+libavcodec's frame threads, so by default there are two loaders sharing the
+cores rather than one per core. The reserve above follows the groups, so
+`J` after playing forwards plays a group's worth from RAM.
+
 **Playback** advances on a clock, but only onto frames that are already
 resident. If the next frame has not arrived, the playhead and the clock both
 hold rather than racing ahead through frames nobody would see; once caching
@@ -203,20 +244,23 @@ src/
   ui.c/.h         layout, hit testing, widget drawing
   view.c/.h       the frame in the viewport: fitted, or zoomed and panned
   cache.c/.h      RAM frame store and loader threads
+  reader.c/.h     the per-thread Reader: a range of frames, delivered one by one
   reader_exr.c    EXR decoding (OpenEXRCore)
-  sequence.c/.h   turning a path, pattern or directory into a frame list
+  reader_video.c  H.264 / H.265 decoding (FFmpeg)
+  sequence.c/.h   turning a path, pattern, directory or video into a frame list
   draw.c/.h       CPU rasteriser: rects, text, triangles, scaled image blit
   font.c/.h       built-in 5x7 bitmap font
   color.c/.h      linear to display transform, as a lookup table
   image.c/.h      reference-counted frame images
   util.c/.h       timing, allocation, byte formatting
 tests/
-  test_player.c   timeline mapping, transport, looping, memory budget
-  test_reader.c   EXR decoding and sequence discovery
+  test_player.c   timeline mapping, transport, looping, memory budget, groups, reserve
+  test_reader.c   EXR and video decoding, sequence discovery
   test_draw.c     the CPU rasteriser
 tools/
   mkexr.c         writes the awkward EXRs the tests need
   make_test_data.sh
+  make_test_video.sh
 ```
 
 `app.c` and `ui.c` know nothing about SDL: `main.c` translates events into the
@@ -232,7 +276,8 @@ an Enter to the terminal so the shell draws a fresh prompt beneath them.
 ## Tests
 
 ```sh
-tools/make_test_data.sh                 # generates fixtures under test/
+tools/make_test_data.sh                 # generates EXR fixtures under test/
+tools/make_test_video.sh                # generates video fixtures under test/video/
 cmake --build build --target test_player test_reader test_draw
 ./build/test_draw
 ./build/test_reader
@@ -240,16 +285,27 @@ cmake --build build --target test_player test_reader test_draw
 ```
 
 On Windows, configure with `--preset windows-fixtures`, build the `mkexr`
-target as well, and run the script from Git Bash in the project root; it finds
-`mkexr` and `exrmaketiled` in the build tree and uses Arial for the burnt-in
-frame numbers. The test executables land in `build\windows\Release\` and are
-run from the project root the same way.
+target as well, and run the scripts from Git Bash in the project root; the
+first finds `mkexr` and `exrmaketiled` in the build tree and uses Arial for
+the burnt-in frame numbers. The test executables land in
+`build\windows\Release\` and are run from the project root the same way.
+
+The video fixtures need an ffmpeg with libx264 and libx265 on PATH, since the
+library build the player links has no encoders. Each is 96 frames whose
+colour encodes the frame number, so a test can tell exactly which frame it
+was handed: closed groups of 24 with B-frames, the same in 10-bit H.265, a
+file with a single keyframe, and one with open groups.
 
 `test_player` drives the same entry points the event loop calls, so the
 timeline mapping, transport buttons, keys, zoom and pan, looping and the
-memory budget are tested the way a user drives them. `test_reader` checks decoding against overscan,
-cropped, tiled, mipmapped, luminance, float and damaged files, and checks that
-a tiled file decodes to exactly the same pixels as the scanline original.
+memory budget are tested the way a user drives them; on video it checks that
+a group is decoded once and only as far as fits, that a scrub seeks, that a
+jump away cancels a group, and that the reserve is there after a reversal.
+`test_reader` checks EXR decoding against overscan, cropped, tiled, mipmapped,
+luminance, float and damaged files, checks that a tiled file decodes to
+exactly the same pixels as the scanline original, and checks every video
+fixture frame by frame, including that ranges which follow on continue
+without a seek and that a cancel stops a range and leaves it resumable.
 
 `test_draw` covers the rasteriser, including the invariant that scaling a flat
 colour by any factor must return exactly that colour — the check that catches
@@ -260,12 +316,12 @@ LeakSanitizer.
 
 ## Not yet
 
-- **Video.** `reader_exr.c` sits behind the small interface in `reader.h`;
-  video belongs alongside it as a second implementation, dispatched on file
-  extension, with FFmpeg decoding to the same display-ready `Image`. Seeking
-  makes video caching different in character: frames come in decode order from
-  the nearest keyframe rather than individually, so the loader would fetch runs
-  of frames rather than one at a time.
+- **More of video.** Variable frame rate (frames are assumed evenly spaced
+  at the container's rate), HDR tone mapping (PQ and HLG footage plays but
+  looks flat), rotation metadata from phones, hardware decoding, and
+  containers other than MP4 and MOV. Reverse play through a group larger
+  than the RAM budget stalls at each group, since a group must be decoded
+  forwards; re-encode with shorter groups or raise `--mem`.
 - **Exposure and view transforms.** The display transform is a fixed
   linear-to-sRGB table built in `color_lut_init()`. Adding exposure means
   rebuilding that table, which is cheap — but frames are cached already

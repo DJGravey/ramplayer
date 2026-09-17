@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "platform.h"
+#include "reader.h"
 #include "util.h"
 
 /* ---- small helpers ------------------------------------------------------ */
@@ -23,6 +24,13 @@ static int has_image_ext(const char *name)
     const char *dot = strrchr(name, '.');
     if (!dot) return 0;
     return ascii_ieq(dot, ".exr");
+}
+
+static int has_video_ext(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    if (!dot) return 0;
+    return ascii_ieq(dot, ".mp4") || ascii_ieq(dot, ".m4v") || ascii_ieq(dot, ".mov");
 }
 
 /* The last path separator in path, or NULL if there is none. */
@@ -299,6 +307,45 @@ static Sequence *finish(FrameVec *fv, const char *dir, char *display, char *err,
     return s;
 }
 
+/* ---- video --------------------------------------------------------------- */
+
+/* One file, many frames. The container's index gives the count, the rate and
+ * where the groups start; the frame list carries numbers only. */
+static Sequence *open_video(const char *path, char *err, size_t errsz)
+{
+    VideoIndex vi;
+    if (!reader_video_index(path, &vi, err, errsz)) return NULL;
+
+    Sequence *s = rp_xcalloc(1, sizeof *s);
+    s->kind        = SEQ_VIDEO;
+    s->count       = vi.count;
+    s->width       = vi.width;
+    s->height      = vi.height;
+    s->fps         = vi.fps;
+    s->video_path  = rp_strdup(path);
+    s->dir         = dir_name(path);
+    s->display     = rp_strdup(base_name(path));
+    s->frames      = rp_xcalloc((size_t)vi.count, sizeof *s->frames);
+    s->group_start = rp_xmalloc((size_t)vi.count * sizeof *s->group_start);
+    s->group_end   = rp_xmalloc((size_t)vi.count * sizeof *s->group_end);
+
+    /* The first frame starts a group whatever the index says, so every frame
+     * has one. */
+    int start = 0;
+    for (int i = 0; i < vi.count; i++) {
+        if (i > 0 && vi.keyframe[i]) start = i;
+        s->frames[i].number = i;
+        s->group_start[i]   = start;
+    }
+    int end = vi.count;
+    for (int i = vi.count - 1; i >= 0; i--) {
+        s->group_end[i] = end;
+        if (s->group_start[i] == i) end = i;
+    }
+    free(vi.keyframe);
+    return s;
+}
+
 Sequence *sequence_open(char *const *inputs, int n_inputs, char *err, size_t errsz)
 {
     FrameVec fv = { 0 };
@@ -307,6 +354,15 @@ Sequence *sequence_open(char *const *inputs, int n_inputs, char *err, size_t err
     if (n_inputs <= 0) {
         snprintf(err, errsz, "no input given");
         return NULL;
+    }
+
+    /* A video is one file on its own; a list or a directory is never one. */
+    if (n_inputs == 1 && has_video_ext(inputs[0])) {
+        if (!rp_is_file(inputs[0])) {
+            snprintf(err, errsz, "no such file: '%s'", inputs[0]);
+            return NULL;
+        }
+        return open_video(inputs[0], err, errsz);
     }
 
     /* Several paths: take them literally, in numeric order. */
@@ -377,5 +433,8 @@ void sequence_free(Sequence *s)
     free(s->frames);
     free(s->dir);
     free(s->display);
+    free(s->video_path);
+    free(s->group_start);
+    free(s->group_end);
     free(s);
 }

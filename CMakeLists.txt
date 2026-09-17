@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
-project(ramplayer C)
+# C only, but vcpkg's FindFFMPEG module enables CXX to learn the C++ runtime
+# libraries FFmpeg's dependencies need, and CMake refuses a language enabled
+# that late; declaring it here costs nothing.
+project(ramplayer C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -49,6 +52,23 @@ else()
     set(RP_EXR_INCLUDE_DIRS ${OPENEXR_INCLUDE_DIRS})
 endif()
 
+# FFmpeg for video: libavformat demuxes, libavcodec decodes H.264 and H.265
+# natively (no x264/x265, so the build stays LGPL), libswscale converts to
+# BGRA. vcpkg's port ships a FindFFMPEG module; pkg-config is the fallback.
+find_package(FFMPEG QUIET)
+if(FFMPEG_FOUND)
+    set(RP_FFMPEG_LIBS ${FFMPEG_LIBRARIES})
+    set(RP_FFMPEG_INCLUDE_DIRS ${FFMPEG_INCLUDE_DIRS})
+    set(RP_FFMPEG_LINK_DIRS ${FFMPEG_LIBRARY_DIRS})
+else()
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+                      libavcodec libavformat libavutil libswscale)
+    set(RP_FFMPEG_LIBS PkgConfig::FFMPEG)
+    set(RP_FFMPEG_INCLUDE_DIRS "")
+    set(RP_FFMPEG_LINK_DIRS "")
+endif()
+
 # ---- compiler settings -----------------------------------------------------
 
 if(MSVC)
@@ -88,7 +108,9 @@ add_executable(ramplayer
     src/font.c
     src/draw.c
     src/sequence.c
+    src/reader.c
     src/reader_exr.c
+    src/reader_video.c
     src/cache.c
     src/ui.c
     src/view.c
@@ -103,27 +125,32 @@ if(WIN32)
     set_target_properties(ramplayer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()
 rp_configure_target(ramplayer)
-target_include_directories(ramplayer PRIVATE ${RP_EXR_INCLUDE_DIRS})
-target_link_libraries(ramplayer PRIVATE ${RP_SDL2_LIBS} ${RP_EXR_LIBS})
+target_include_directories(ramplayer PRIVATE ${RP_EXR_INCLUDE_DIRS} ${RP_FFMPEG_INCLUDE_DIRS})
+target_link_directories(ramplayer PRIVATE ${RP_FFMPEG_LINK_DIRS})
+target_link_libraries(ramplayer PRIVATE ${RP_SDL2_LIBS} ${RP_EXR_LIBS} ${RP_FFMPEG_LIBS})
 
 # Behavioural tests. They drive app.c/ui.c directly, so no window is needed,
 # but they do decode real frames and therefore need a sequence to point at.
 add_executable(test_player EXCLUDE_FROM_ALL
     tests/test_player.c
     src/platform.c src/util.c src/color.c src/image.c src/font.c src/draw.c
-    src/sequence.c src/reader_exr.c src/cache.c src/ui.c src/view.c src/app.c
+    src/sequence.c src/reader.c src/reader_exr.c src/reader_video.c
+    src/cache.c src/ui.c src/view.c src/app.c
 )
 rp_configure_target(test_player)
-target_include_directories(test_player PRIVATE src ${RP_EXR_INCLUDE_DIRS})
-target_link_libraries(test_player PRIVATE ${RP_EXR_LIBS})
+target_include_directories(test_player PRIVATE src ${RP_EXR_INCLUDE_DIRS} ${RP_FFMPEG_INCLUDE_DIRS})
+target_link_directories(test_player PRIVATE ${RP_FFMPEG_LINK_DIRS})
+target_link_libraries(test_player PRIVATE ${RP_EXR_LIBS} ${RP_FFMPEG_LIBS})
 
 add_executable(test_reader EXCLUDE_FROM_ALL
     tests/test_reader.c
-    src/platform.c src/util.c src/color.c src/image.c src/sequence.c src/reader_exr.c
+    src/platform.c src/util.c src/color.c src/image.c src/sequence.c
+    src/reader.c src/reader_exr.c src/reader_video.c
 )
 rp_configure_target(test_reader)
-target_include_directories(test_reader PRIVATE src ${RP_EXR_INCLUDE_DIRS})
-target_link_libraries(test_reader PRIVATE ${RP_EXR_LIBS})
+target_include_directories(test_reader PRIVATE src ${RP_EXR_INCLUDE_DIRS} ${RP_FFMPEG_INCLUDE_DIRS})
+target_link_directories(test_reader PRIVATE ${RP_FFMPEG_LINK_DIRS})
+target_link_libraries(test_reader PRIVATE ${RP_EXR_LIBS} ${RP_FFMPEG_LIBS})
 
 add_executable(test_draw EXCLUDE_FROM_ALL
     tests/test_draw.c

@@ -12,6 +12,12 @@
  * playhead than it is; that admission rule is what stops the threads from
  * thrashing a full cache.
  *
+ * Video frames come in groups that decode together, so a worker that picks a
+ * frame claims its whole group, decodes it from the keyframe, and hands each
+ * frame over as it lands; it stops early once the rest of the group is out
+ * of reach, and the reader keeps its place so the playhead arriving later
+ * carries on without a seek. An image frame is a group of one.
+ *
  * The Sequence passed to cache_create() must outlive the cache: loader threads
  * read paths out of it without holding the lock.
  */
@@ -33,7 +39,8 @@ typedef enum {
 
 typedef struct {
     int    ready;
-    int    loading;
+    int    loading;         /* frames claimed by a loader and not yet landed;
+                               a whole group at a time for video */
     int    failed;
     size_t bytes_used;
     size_t bytes_limit;
@@ -45,6 +52,13 @@ typedef struct {
     int    aborted;         /* decodes abandoned part way because the playhead
                                jumped out of reach of the frame; the thread
                                went to a frame that mattered instead */
+    int    delivered;       /* frames the readers handed over, wanted or not;
+                               against `ready` it shows how much decoding was
+                               done for nothing */
+    int    decoded;         /* video only: pictures decoded, including those
+                               decoded on the way to a frame and never
+                               delivered; against `delivered` it shows the
+                               cost of seeking */
 } CacheStats;
 
 typedef struct Cache Cache;
@@ -58,6 +72,14 @@ void   cache_destroy(Cache *c);
  * is abandoned, so a jump across the timeline frees the threads for the frames
  * around the new position instead of waiting for the old ones to finish. */
 void cache_set_focus(Cache *c, int frame, int direction);
+
+/* How many frames behind the playhead, against the direction of play, are
+ * kept in preference to frames far ahead, so a reversal plays from RAM while
+ * the loaders turn around. Capped at half the budget. For a video the reserve
+ * follows the groups instead (the frames of the current group already shown
+ * plus the whole group before) and this setting is not used. Default 0, which
+ * is the plain ordering: frames behind go first, farthest first. */
+void cache_set_reserve(Cache *c, int frames);
 
 /* Returns the frame with an extra reference, or NULL if it is not resident.
  * Never blocks on I/O. The caller must image_unref() the result; holding a
